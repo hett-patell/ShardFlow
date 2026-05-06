@@ -30,6 +30,11 @@ Per-target rules are tagged with an nft `comment` of `shardflow:<mac>` so `nftmg
 **Implementer-discretion cleanups (apply if they read clean, ignore otherwise):**
 - `github.com/google/gopacket` is in maintenance mode; the active fork is `github.com/gopacket/gopacket`. Either works; if you choose the fork, change every `import` line consistently across all packages.
 
+**Spec deviations deferred to v1.1 (not implemented in v1; events are declared but not emitted):**
+- `iface.up` / `iface.down` events (declared in `rpc/types.go`) are not emitted in v1. Spec §10 specifies that policies be re-applied on `iface.up`; no goroutine in the daemon monitors interface state. The TUI's hint about "wlan0 down — N policies suspended" is therefore unreachable. Add an interface-watch goroutine in v1.1.
+- `pcap.rotated` event is declared but never emitted by `pcapwriter`. Add the broadcast in v1.1 — the rotation point in `runWriter.open()` is the obvious site.
+- `devicestore.SetPolicy(mac, any)` is exported but unused — the compiler's `current` map is the authoritative store of per-target policy state. Kept as preparatory surface for a future "policy displayed inline in device list via devicestore subscription" path; can be deleted in v1.1 if that path doesn't materialise.
+
 **Operator footguns (document in README, do not gate v1):**
 - `--clean-on-start` removes the **whole** ingress qdisc on the operator's real iface, not just ShardFlow's filters. Any unrelated `tc` filters another tool placed there are destroyed. This is acceptable for dedicated lab/test interfaces; on a workstation that has other tc state, run shardflowd in a netns or accept the loss.
 - `internal/scan/mdns` binds UDP port 5353 explicitly. On hosts running `avahi-daemon` (default on most desktop Linux distros) the bind fails with `EADDRINUSE`. Workarounds, in order of preference: stop avahi for the session (`systemctl stop avahi-daemon`), run shardflowd in a netns, or change the package to bind ephemeral with `SO_REUSEPORT`. Documented as a known v1 limitation.
