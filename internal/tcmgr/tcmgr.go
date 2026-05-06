@@ -93,29 +93,29 @@ func (m *Manager) EnsureRedirect(ctx context.Context, realIface string) error {
 }
 
 // SetThrottle adds an HTB class for a target at the given rate, plus a flow
-// filter on the IFB iface that maps the fwmark to that class, plus a
-// redirect filter on the real iface ingress. Caller (the compiler) supplies
-// the mark; mark must already be set on the frame by nftmgr's netdev-ingress
-// chain.
+// filter on the IFB iface that maps the target's source MAC to that class,
+// plus a flower-based redirect filter on the real iface ingress that sends
+// frames from the target into the IFB. The mark argument is used as a
+// stable, target-unique tc filter priority; the matching itself is on
+// src_mac (not fwmark — see argvAddRedirectFilterByMAC's comment for why).
 //
 // Atomicity: self-rollbacking. On failure of any step the already-completed
-// steps are reversed before returning. No per-mac bookkeeping — class id is
-// derived from the mark, so a failed cleanup is fully retryable.
+// steps are reversed before returning.
 func (m *Manager) SetThrottle(ctx context.Context, realIface, mac, rate string, mark uint32) error {
 	classID := classIDFor(mark)
+	prio := mark & 0x7FFF // pack into uint16 (0..32767), pcap uses 0x8000+
 	if _, err := m.r.Run(ctx, "tc", argvAddHTBClass(IFBName, classID, rate)); err != nil {
 		return err
 	}
-	if _, err := m.r.Run(ctx, "tc", argvAddFlowFilterByMark(IFBName, mark, classID)); err != nil {
+	if _, err := m.r.Run(ctx, "tc", argvAddFlowFilterByMAC(IFBName, mac, classID, prio)); err != nil {
 		_, _ = m.r.Run(ctx, "tc", argvDelHTBClass(IFBName, classID))
 		return err
 	}
-	if _, err := m.r.Run(ctx, "tc", argvAddRedirectFilter(realIface, mark, IFBName)); err != nil {
-		_, _ = m.r.Run(ctx, "tc", argvDelFlowFilterByMark(IFBName, mark))
+	if _, err := m.r.Run(ctx, "tc", argvAddRedirectFilterByMAC(realIface, mac, IFBName, prio)); err != nil {
+		_, _ = m.r.Run(ctx, "tc", argvDelFlowFilterByPrio(IFBName, prio))
 		_, _ = m.r.Run(ctx, "tc", argvDelHTBClass(IFBName, classID))
 		return err
 	}
-	_ = mac // kept for symmetry / future diagnostics
 	return nil
 }
 
@@ -125,6 +125,7 @@ func (m *Manager) SetThrottle(ctx context.Context, realIface, mac, rate string, 
 // idempotent success.
 func (m *Manager) ClearThrottle(ctx context.Context, realIface, mac string, mark uint32) error {
 	classID := classIDFor(mark)
+	prio := mark & 0x7FFF
 
 	var firstErr error
 	record := func(out []byte, err error) {
@@ -133,9 +134,9 @@ func (m *Manager) ClearThrottle(ctx context.Context, realIface, mac string, mark
 		}
 		firstErr = err
 	}
-	out, err := m.r.Run(ctx, "tc", argvDelFilterByMark(realIface, mark, "1"))
+	out, err := m.r.Run(ctx, "tc", argvDelFilterByPrio(realIface, prio))
 	record(out, err)
-	out, err = m.r.Run(ctx, "tc", argvDelFlowFilterByMark(IFBName, mark))
+	out, err = m.r.Run(ctx, "tc", argvDelFlowFilterByPrio(IFBName, prio))
 	record(out, err)
 	out, err = m.r.Run(ctx, "tc", argvDelHTBClass(IFBName, classID))
 	record(out, err)
@@ -143,15 +144,25 @@ func (m *Manager) ClearThrottle(ctx context.Context, realIface, mac string, mark
 	return firstErr
 }
 
-// SetCapture installs a mirror filter on real iface ingress that copies
-// marked frames to the shardflow-cap dummy iface.
-func (m *Manager) SetCapture(ctx context.Context, realIface string, mark uint32) error {
-	_, err := m.r.Run(ctx, "tc", argvAddMirrorFilter(realIface, mark, CaptureName))
+// SetCapture installs a flower mirror filter on real iface ingress that
+// copies frames from src_mac to the shardflow-cap dummy iface (where
+// pcapwriter reads them). prio is the mark — stable per-target.
+func (m *Manager) SetCapture(ctx context.Context, realIface, mac string, mark uint32) error {
+	// pcap uses prio=mark+0x10000 to keep it disjoint from throttle's prio
+	// (so a single MAC can have both policies without filter collision in
+	// theory — though in practice policies are mutually exclusive).
+	// Pack into uint16 prio with low/high half-spaces so a single MAC could
+	// hold both throttle (low) and pcap (high) without collision.
+	prio := (mark & 0x7FFF) | 0x8000
+	_, err := m.r.Run(ctx, "tc", argvAddMirrorFilterByMAC(realIface, mac, CaptureName, prio))
 	return err
 }
 
 func (m *Manager) ClearCapture(ctx context.Context, realIface string, mark uint32) error {
-	out, err := m.r.Run(ctx, "tc", argvDelFilterByMark(realIface, mark, "2"))
+	// Pack into uint16 prio with low/high half-spaces so a single MAC could
+	// hold both throttle (low) and pcap (high) without collision.
+	prio := (mark & 0x7FFF) | 0x8000
+	out, err := m.r.Run(ctx, "tc", argvDelFilterByPrio(realIface, prio))
 	if err != nil && !isMissing(out) {
 		return err
 	}

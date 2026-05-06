@@ -42,36 +42,50 @@ func argvAddIngressQdisc(iface string) []string {
 	return []string{"qdisc", "add", "dev", iface, "handle", "ffff:", "ingress"}
 }
 
-// Filter that matches fwmark on ingress and redirects matched frames into
-// the IFB iface for HTB shaping.
-func argvAddRedirectFilter(iface string, mark uint32, ifb string) []string {
+// Filter that matches src_mac on ingress and redirects matched frames into
+// the IFB iface for HTB shaping. Uses flower (which can match L2 fields
+// directly) instead of `fw mark` because tc-ingress fires BEFORE the nft
+// netdev-ingress hook in the kernel rx path — a fwmark set by nft is not
+// yet on the skb when this filter checks it. flower matches the source MAC
+// directly, so no mark intermediary is needed.
+func argvAddRedirectFilterByMAC(iface, srcMAC, ifb string, prio uint32) []string {
 	return []string{"filter", "add", "dev", iface, "parent", "ffff:",
-		"protocol", "all", "prio", "1",
-		"handle", strconv.FormatUint(uint64(mark), 10), "fw",
+		"protocol", "all", "prio", strconv.FormatUint(uint64(prio), 10),
+		"flower", "src_mac", srcMAC,
 		"action", "mirred", "egress", "redirect", "dev", ifb}
 }
 
-// Filter that matches fwmark on ingress and mirrors matched frames to a
-// dummy iface that pcapwriter reads. Mirror (not redirect) so the original
-// frame still flows.
-func argvAddMirrorFilter(iface string, mark uint32, dummy string) []string {
+// Mirror filter that matches src_mac on ingress and copies matched frames
+// to the capture dummy iface (so pcapwriter sees them). Same flower-vs-fw
+// rationale as argvAddRedirectFilterByMAC.
+func argvAddMirrorFilterByMAC(iface, srcMAC, dummy string, prio uint32) []string {
 	return []string{"filter", "add", "dev", iface, "parent", "ffff:",
-		"protocol", "all", "prio", "2",
-		"handle", strconv.FormatUint(uint64(mark), 10), "fw",
+		"protocol", "all", "prio", strconv.FormatUint(uint64(prio), 10),
+		"flower", "src_mac", srcMAC,
 		"action", "mirred", "egress", "mirror", "dev", dummy}
 }
 
-// Delete all fw-handle filters for a given mark on the iface ingress.
-func argvDelFilterByMark(iface string, mark uint32, prio string) []string {
+// Delete a flower filter on the iface ingress qdisc by priority. Each
+// target gets a unique prio so this removes only that target's filter.
+func argvDelFilterByPrio(iface string, prio uint32) []string {
 	return []string{"filter", "del", "dev", iface, "parent", "ffff:",
-		"protocol", "all", "prio", prio,
-		"handle", strconv.FormatUint(uint64(mark), 10), "fw"}
+		"protocol", "all", "prio", strconv.FormatUint(uint64(prio), 10)}
 }
 
-// Delete the IFB-side fw-handle flow filter that maps fwmark → HTB class.
-// Used by ClearThrottle so SetThrottle's filter doesn't accumulate on
-// shardflow0 across set/clear cycles.
-func argvDelFlowFilterByMark(iface string, mark uint32) []string {
-	return []string{"filter", "del", "dev", iface, "protocol", "all", "parent", "1:",
-		"prio", "1", "handle", strconv.FormatUint(uint64(mark), 10), "fw"}
+// Flower classifier on the IFB qdisc that directs frames matching src_mac
+// into a specific HTB class. `classid <id>` is the classifier directive
+// (no `action ok` — that would treat this as an action chain rather than
+// a classifier and cause flowid to be silently ignored, leaving traffic
+// to fall through to the default class which is not created).
+func argvAddFlowFilterByMAC(ifb, srcMAC, classID string, prio uint32) []string {
+	return []string{"filter", "add", "dev", ifb, "protocol", "all", "parent", "1:",
+		"prio", strconv.FormatUint(uint64(prio), 10),
+		"flower", "src_mac", srcMAC,
+		"classid", classID}
+}
+
+// Delete the IFB-side flower filter for a given priority.
+func argvDelFlowFilterByPrio(ifb string, prio uint32) []string {
+	return []string{"filter", "del", "dev", ifb, "protocol", "all", "parent", "1:",
+		"prio", strconv.FormatUint(uint64(prio), 10)}
 }

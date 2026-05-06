@@ -126,7 +126,7 @@ func (noopTC) EnsureCaptureIface(context.Context) error                     { re
 func (noopTC) EnsureRedirect(context.Context, string) error                 { return nil }
 func (noopTC) SetThrottle(context.Context, string, string, string, uint32) error { return nil }
 func (noopTC) ClearThrottle(context.Context, string, string, uint32) error  { return nil }
-func (noopTC) SetCapture(context.Context, string, uint32) error             { return nil }
+func (noopTC) SetCapture(context.Context, string, string, uint32) error     { return nil }
 func (noopTC) ClearCapture(context.Context, string, uint32) error           { return nil }
 func (noopTC) Teardown(context.Context) error                               { return nil }
 

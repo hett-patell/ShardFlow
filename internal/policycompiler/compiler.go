@@ -129,28 +129,17 @@ func (c *Compiler) bringUpOne(ctx context.Context, s Spec) error {
 			undo: func() error { return c.nft.RemoveTarget(ctx, s.Target.MAC) },
 		})
 	case KindThrottle:
-		steps = append(steps, step{
-			do:   func() error { return c.nft.AddTargetMark(ctx, s.Target.MAC, mark) },
-			undo: func() error { return c.nft.RemoveTarget(ctx, s.Target.MAC) },
-		})
+		// tc-flower matches src_mac directly, so no nft-mark indirection
+		// is needed. tc ingress fires before nft netdev-ingress in the rx
+		// path, so a fwmark set by nft would not yet be on the skb when
+		// the tc filter checks it.
 		steps = append(steps, step{
 			do:   func() error { return c.tc.SetThrottle(ctx, c.realIface, macStr, rate, mark) },
 			undo: func() error { return c.tc.ClearThrottle(ctx, c.realIface, macStr, mark) },
 		})
 	case KindPcap:
-		// Two nft mark rules — egress (target→gw) and return (gw→target).
 		steps = append(steps, step{
-			do:   func() error { return c.nft.AddTargetMark(ctx, s.Target.MAC, mark) },
-			undo: func() error { return c.nft.RemoveTarget(ctx, s.Target.MAC) },
-		})
-		steps = append(steps, step{
-			do: func() error {
-				return c.nft.AddReturnMark(ctx, s.Target.MAC, s.Target.GwMAC, s.Target.IP, mark)
-			},
-			undo: func() error { return c.nft.RemoveTarget(ctx, s.Target.MAC) },
-		})
-		steps = append(steps, step{
-			do:   func() error { return c.tc.SetCapture(ctx, c.realIface, mark) },
+			do:   func() error { return c.tc.SetCapture(ctx, c.realIface, macStr, mark) },
 			undo: func() error { return c.tc.ClearCapture(ctx, c.realIface, mark) },
 		})
 		steps = append(steps, step{
@@ -196,11 +185,9 @@ func (c *Compiler) tearDownOne(ctx context.Context, s Spec) error {
 	switch s.Kind {
 	case KindThrottle:
 		record(c.tc.ClearThrottle(ctx, c.realIface, macStr, mark))
-		record(c.nft.RemoveTarget(ctx, s.Target.MAC))
 	case KindPcap:
 		record(c.pcap.Close(macStr))
 		record(c.tc.ClearCapture(ctx, c.realIface, mark))
-		record(c.nft.RemoveTarget(ctx, s.Target.MAC))
 	case KindDrop:
 		record(c.nft.RemoveTarget(ctx, s.Target.MAC))
 	}

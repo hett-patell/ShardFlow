@@ -53,7 +53,7 @@ type TC interface {
 	EnsureRedirect(ctx context.Context, realIface string) error
 	SetThrottle(ctx context.Context, realIface, mac, rate string, mark uint32) error
 	ClearThrottle(ctx context.Context, realIface, mac string, mark uint32) error
-	SetCapture(ctx context.Context, realIface string, mark uint32) error
+	SetCapture(ctx context.Context, realIface, mac string, mark uint32) error
 	ClearCapture(ctx context.Context, realIface string, mark uint32) error
 	Teardown(ctx context.Context) error
 }

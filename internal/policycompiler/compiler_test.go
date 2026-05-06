@@ -53,7 +53,7 @@ func (f *fakeTC) ClearThrottle(_ context.Context, _, mac string, mark uint32) er
 	f.calls = append(f.calls, fmt.Sprintf("ClearThrottle:%s:%d", mac, mark))
 	return nil
 }
-func (f *fakeTC) SetCapture(_ context.Context, _ string, mark uint32) error {
+func (f *fakeTC) SetCapture(_ context.Context, _, _ string, mark uint32) error {
 	f.calls = append(f.calls, fmt.Sprintf("SetCapture:%d", mark))
 	return nil
 }
@@ -112,8 +112,9 @@ func TestApplyThrottleSequence(t *testing.T) {
 	}
 	require.NoError(t, c.Apply(context.Background(), desired))
 
-	// Order per spec §7.4: nft (mark) first, then tc (throttle), then arp.
-	assert.Equal(t, fmt.Sprintf("AddMark:%s:11", mac.String()), nft.calls[0])
+	// nft is no longer in the throttle path (tc-flower matches src_mac
+	// directly without an nft-mark intermediary; see compiler comment).
+	assert.Empty(t, nft.calls)
 	assert.Equal(t, fmt.Sprintf("SetThrottle:%s:200kbit:11", mac.String()), tc.calls[0])
 	assert.Equal(t, "Start:"+mac.String(), arp.calls[0])
 }

@@ -23,22 +23,22 @@ func TestArgvAddIngressQdisc(t *testing.T) {
 	assert.Equal(t, []string{"qdisc", "add", "dev", "eth0", "handle", "ffff:", "ingress"}, got)
 }
 
-func TestArgvAddRedirectFilter(t *testing.T) {
-	got := argvAddRedirectFilter("eth0", 42, "shardflow0")
+func TestArgvAddRedirectFilterByMAC(t *testing.T) {
+	got := argvAddRedirectFilterByMAC("eth0", "02:00:00:00:99:42", "shardflow0", 42)
 	assert.Equal(t, []string{
 		"filter", "add", "dev", "eth0", "parent", "ffff:",
-		"protocol", "all", "prio", "1",
-		"handle", "42", "fw",
+		"protocol", "all", "prio", "42",
+		"flower", "src_mac", "02:00:00:00:99:42",
 		"action", "mirred", "egress", "redirect", "dev", "shardflow0",
 	}, got)
 }
 
-func TestArgvAddMirrorFilter(t *testing.T) {
-	got := argvAddMirrorFilter("eth0", 42, "shardflow-cap")
+func TestArgvAddMirrorFilterByMAC(t *testing.T) {
+	got := argvAddMirrorFilterByMAC("eth0", "02:00:00:00:99:42", "shardflow-cap", 42)
 	assert.Equal(t, []string{
 		"filter", "add", "dev", "eth0", "parent", "ffff:",
-		"protocol", "all", "prio", "2",
-		"handle", "42", "fw",
+		"protocol", "all", "prio", "42",
+		"flower", "src_mac", "02:00:00:00:99:42",
 		"action", "mirred", "egress", "mirror", "dev", "shardflow-cap",
 	}, got)
 }
