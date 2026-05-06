@@ -185,7 +185,7 @@ fmt:
 	$(GO) fmt ./...
 
 lint: vet
-	@which golangci-lint > /dev/null && golangci-lint run || echo "(skipping golangci-lint, not installed)"
+	@if command -v golangci-lint >/dev/null 2>&1; then golangci-lint run; else echo "(skipping golangci-lint, not installed)"; fi
 
 clean:
 	rm -rf $(BIN_DIR) coverage.out coverage.html
