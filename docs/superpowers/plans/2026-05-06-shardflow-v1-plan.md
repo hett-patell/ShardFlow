@@ -1987,6 +1987,7 @@ package arpengine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -2024,6 +2025,7 @@ type runner struct {
 	target  Target
 	cancel  context.CancelFunc
 	started time.Time
+	done    chan struct{} // closed when loop exits and pcap handle is freed
 }
 
 // New returns an engine bound to a specific interface and operator MAC.
@@ -2036,26 +2038,45 @@ func New(iface string, opMAC net.HardwareAddr, cadence time.Duration) *Engine {
 }
 
 // Start begins poisoning t. Idempotent: starting an already-active target
-// is a no-op (returns nil without restarting).
+// is a no-op (returns nil without restarting). Releases e.mu around
+// pcap.OpenLive so a slow iface doesn't serialise every other engine op.
 func (e *Engine) Start(t Target) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	key := t.MAC.String()
+	e.mu.Lock()
 	if _, exists := e.active[key]; exists {
+		e.mu.Unlock()
 		return nil
 	}
+	e.mu.Unlock()
+
 	handle, err := pcap.OpenLive(e.iface, 65536, false, pcap.BlockForever)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", e.iface, err)
 	}
+
+	e.mu.Lock()
+	if _, exists := e.active[key]; exists {
+		// Lost the race — another caller installed a runner first. Close
+		// our orphan handle and return success.
+		e.mu.Unlock()
+		handle.Close()
+		return nil
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	r := &runner{target: t, cancel: cancel, started: time.Now()}
+	r := &runner{target: t, cancel: cancel, started: time.Now(), done: make(chan struct{})}
 	e.active[key] = r
-	go e.loop(ctx, handle, t)
+	e.mu.Unlock()
+
+	go e.loop(ctx, handle, t, r.done)
 	return nil
 }
 
-func (e *Engine) loop(ctx context.Context, handle *pcap.Handle, t Target) {
+func (e *Engine) loop(ctx context.Context, handle *pcap.Handle, t Target, done chan struct{}) {
+	// LIFO defers: close(done) runs LAST, after handle.Close. Stop unblocks
+	// only once the pcap handle is released, eliminating the race where the
+	// goroutine's final WritePacketData lands on the wire after Stop's
+	// corrective ARPs.
+	defer close(done)
 	defer handle.Close()
 	tick := time.NewTicker(e.cadence)
 	defer tick.Stop()
@@ -2081,8 +2102,9 @@ func (e *Engine) loop(ctx context.Context, handle *pcap.Handle, t Target) {
 }
 
 // Stop halts poisoning of the named target and emits corrective ARPs
-// asserting the real (gw,target) mappings. Blocks for up to 3*cadence to
-// give caches time to recover. No-op for unknown targets.
+// asserting the real (gw,target) mappings. Blocks until the poison
+// goroutine exits AND the corrective sequence completes — total wait is
+// approximately 3*cadence (default 3 s). No-op for unknown targets.
 func (e *Engine) Stop(t Target) error {
 	e.mu.Lock()
 	r, ok := e.active[t.MAC.String()]
@@ -2093,6 +2115,7 @@ func (e *Engine) Stop(t Target) error {
 	delete(e.active, t.MAC.String())
 	e.mu.Unlock()
 	r.cancel()
+	<-r.done // wait for the loop's deferred handle.Close → close(done) chain
 
 	handle, err := pcap.OpenLive(e.iface, 65536, false, pcap.BlockForever)
 	if err != nil {
@@ -2113,7 +2136,8 @@ func (e *Engine) Stop(t Target) error {
 	return nil
 }
 
-// StopAll halts every active poison. Errors are aggregated.
+// StopAll halts every active poison. Per-target errors from Stop are
+// aggregated via errors.Join.
 func (e *Engine) StopAll() error {
 	e.mu.Lock()
 	targets := make([]Target, 0, len(e.active))
@@ -2121,21 +2145,35 @@ func (e *Engine) StopAll() error {
 		targets = append(targets, r.target)
 	}
 	e.mu.Unlock()
+	var errs []error
 	for _, t := range targets {
-		_ = e.Stop(t)
+		if err := e.Stop(t); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
-// Active returns a snapshot of in-flight poisons.
+// Active returns a snapshot of in-flight poisons. Target slice fields
+// (MAC, IP, GwMAC, GwIP) are deep-copied so callers can't corrupt the
+// engine's internal state by mutating returned bytes.
 func (e *Engine) Active() []ActivePoison {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := make([]ActivePoison, 0, len(e.active))
 	for _, r := range e.active {
-		out = append(out, ActivePoison{Target: r.target, Started: r.started})
+		out = append(out, ActivePoison{Target: copyTarget(r.target), Started: r.started})
 	}
 	return out
+}
+
+func copyTarget(t Target) Target {
+	return Target{
+		MAC:   append(net.HardwareAddr{}, t.MAC...),
+		IP:    append(net.IP{}, t.IP...),
+		GwMAC: append(net.HardwareAddr{}, t.GwMAC...),
+		GwIP:  append(net.IP{}, t.GwIP...),
+	}
 }
 ```
 
