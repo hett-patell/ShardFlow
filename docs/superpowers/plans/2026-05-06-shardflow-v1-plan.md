@@ -2467,8 +2467,8 @@ func (m *Manager) RemoveTarget(ctx context.Context, mac net.HardwareAddr) error 
 	for _, t := range tables {
 		out, err := m.r.Run(ctx, t.listArgs)
 		if err != nil {
-			if bytes.Contains(out, []byte("No such file")) {
-				continue // table not created yet — fine
+			if nftMissing(out) {
+				continue // table not created yet — idempotent success
 			}
 			record(fmt.Errorf("list %s/%s: %w", t.family, t.table, err))
 			continue
