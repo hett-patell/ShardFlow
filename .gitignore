@@ -1,5 +1,20 @@
-# Local plugin state, not part of the project.
-.remember/
+# Binaries
+/bin/
+/cmd/shardflow/shardflow
+/cmd/shardflowd/shardflowd
 
-# Build artifacts (Task 0.1 will add the rest of these later in a real
-# .gitignore committed alongside go.mod; this file is just the baseline).
+# Test artifacts
+*.pcap
+/coverage.out
+/coverage.html
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Local plugin state
+.remember/
