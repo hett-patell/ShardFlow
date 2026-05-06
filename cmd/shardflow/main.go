@@ -3,9 +3,13 @@ package main
 import (
 	"fmt"
 	"os"
+
+	"github.com/hett-patell/ShardFlow/internal/cli"
 )
 
 func main() {
-	fmt.Fprintln(os.Stderr, "shardflow: not yet implemented")
-	os.Exit(1)
+	if err := cli.NewRoot().Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }
