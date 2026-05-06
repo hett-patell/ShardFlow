@@ -4,6 +4,7 @@
 package integration
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -30,6 +31,10 @@ func startDaemon(t *testing.T) {
 	require.NoError(t, netns.Setup())
 	t.Cleanup(func() { _ = netns.Teardown() })
 
+	// Strip any stale socket from a prior test before launching, so the
+	// post-Start polling can't see a leftover and report ready prematurely.
+	_ = os.Remove("/tmp/sf.sock")
+
 	build := exec.Command("go", "build", "-o", "/tmp/shardflowd", "./cmd/shardflowd")
 	build.Dir = repoRoot()
 	out, err := build.CombinedOutput()
@@ -42,16 +47,21 @@ func startDaemon(t *testing.T) {
 
 	daemon := exec.Command("ip", "netns", "exec", "lab-op",
 		"/tmp/shardflowd", "-i", "eth0", "-sock", "/tmp/sf.sock", "--force", "--clean-on-start")
+	daemon.Stdout = os.Stderr
+	daemon.Stderr = os.Stderr
 	require.NoError(t, daemon.Start())
 	t.Cleanup(func() { _ = daemon.Process.Kill() })
 
-	for i := 0; i < 50; i++ {
-		if _, err := netns.InNS("lab-op", "test", "-S", "/tmp/sf.sock"); err == nil {
+	// Poll for the socket plus a real connectivity check — `test -S` only
+	// proves the inode exists; an actual dial proves the daemon is past
+	// srv.Listen and accepting connections.
+	for i := 0; i < 100; i++ {
+		if _, err := netns.InNS("lab-op", "/tmp/shardflow", "--sock", "/tmp/sf.sock", "devices", "list", "--json"); err == nil {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatal("daemon socket /tmp/sf.sock did not appear")
+	t.Fatal("daemon socket /tmp/sf.sock did not become reachable")
 }
 
 func scanAndAwaitVictim(t *testing.T) {
@@ -62,6 +72,12 @@ func scanAndAwaitVictim(t *testing.T) {
 		out, _ := netns.InNS("lab-op", "/tmp/shardflow", "--sock", "/tmp/sf.sock",
 			"devices", "list", "--json")
 		if strings.Contains(string(out), "10.0.99.42") {
+			// Warm lab-vic's ARP cache for the gateway. Real-world targets
+			// have chatty caches; arpengine relies on its gratuitous replies
+			// updating an *existing* entry (Linux's default arp_accept=0
+			// ignores unsolicited gratuitous replies that would create new
+			// entries). Without this, the poison silently no-ops.
+			_, _ = netns.InNS("lab-vic", "ping", "-c", "1", "-W", "1", "10.0.99.1")
 			return
 		}
 		time.Sleep(100 * time.Millisecond)

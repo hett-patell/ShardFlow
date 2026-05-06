@@ -22,21 +22,25 @@ ip -n "$BR_NS" link add "$BR" type bridge
 ip -n "$BR_NS" link set "$BR" up
 
 create_node() {
-  local name=$1 ip=$2 veth_outer=$3 veth_inner=$4
+  local name=$1 ip=$2 veth_outer=$3 veth_inner=$4 inner_mac=$5
   ip netns add "$name"
   ip link add "$veth_outer" type veth peer name "$veth_inner"
   ip link set "$veth_inner" netns "$name"
   ip link set "$veth_outer" netns "$BR_NS"
   ip -n "$BR_NS" link set "$veth_outer" master "$BR"
   ip -n "$BR_NS" link set "$veth_outer" up
+  ip -n "$name" link set "$veth_inner" address "$inner_mac"
   ip -n "$name" addr add "$ip"/24 dev "$veth_inner"
   ip -n "$name" link set lo up
   ip -n "$name" link set "$veth_inner" up
 }
 
-create_node lab-gw  10.0.99.1  lab-veth-gw  eth0
-create_node lab-vic 10.0.99.42 lab-veth-vic eth0
-create_node lab-op  10.0.99.5  lab-veth-op  eth0
+# Explicit MACs avoid the flakiness we saw when the kernel handed out
+# pseudo-random veth MACs that happened to repeat across runs and broke
+# kernel-ARP resolution from lab-op.
+create_node lab-gw  10.0.99.1  lab-veth-gw  eth0 02:00:00:00:99:01
+create_node lab-vic 10.0.99.42 lab-veth-vic eth0 02:00:00:00:99:42
+create_node lab-op  10.0.99.5  lab-veth-op  eth0 02:00:00:00:99:05
 
 ip -n lab-vic route add default via 10.0.99.1
 ip -n lab-op route add default via 10.0.99.1

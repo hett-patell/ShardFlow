@@ -28,14 +28,18 @@ func TestThrottlePolicyLimitsBandwidth(t *testing.T) {
 	out, err = netns.InNS("lab-vic", "iperf3", "-c", "10.0.99.1", "-t", "3", "-J")
 	require.NoError(t, err, string(out))
 
+	// Read sum_received, not sum_sent: under throttle the kernel drops
+	// excess packets and TCP retransmits inflate sum_sent above the wire
+	// rate. sum_received is what actually arrived at the receiver, which
+	// is what HTB caps.
 	var report struct {
 		End struct {
-			SumSent struct {
+			SumReceived struct {
 				BitsPerSecond float64 `json:"bits_per_second"`
-			} `json:"sum_sent"`
+			} `json:"sum_received"`
 		} `json:"end"`
 	}
 	require.NoError(t, json.Unmarshal(out, &report), "iperf3 json parse: %s", out)
-	require.Less(t, report.End.SumSent.BitsPerSecond, float64(300_000),
-		"throttle did not limit bandwidth: %v bps", report.End.SumSent.BitsPerSecond)
+	require.Less(t, report.End.SumReceived.BitsPerSecond, float64(300_000),
+		"throttle did not limit bandwidth: %v bps", report.End.SumReceived.BitsPerSecond)
 }
