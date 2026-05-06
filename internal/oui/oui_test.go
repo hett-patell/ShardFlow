@@ -14,7 +14,9 @@ func TestLookupKnownVendor(t *testing.T) {
 }
 
 func TestLookupUnknownVendor(t *testing.T) {
-	mac, _ := net.ParseMAC("00:00:00:AA:BB:CC")
+	// Locally-administered MACs have no IEEE OUI assignment, so Lookup
+	// must return "". 02:* is the canonical "locally administered" prefix.
+	mac, _ := net.ParseMAC("02:00:00:AA:BB:CC")
 	v := Lookup(mac)
 	assert.Equal(t, "", v)
 }
