@@ -88,3 +88,29 @@ func TestSetPolicyUnknownMAC(t *testing.T) {
 	ok := s.SetPolicy(mac("aa:bb:cc:dd:ee:99"), "drop")
 	assert.False(t, ok)
 }
+
+func TestSetPolicyKnownMACBroadcastsUpdate(t *testing.T) {
+	s := New()
+	ch := s.Subscribe()
+	t.Cleanup(func() { s.Unsubscribe(ch) })
+	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:01"), IP: net.ParseIP("10.0.0.42")})
+
+	// Drain the discovery event from the Upsert above.
+	<-ch
+
+	ok := s.SetPolicy(mac("aa:bb:cc:dd:ee:01"), "drop")
+	require.True(t, ok)
+
+	// SetPolicy broadcasts asynchronously (`go s.broadcast(...)`); allow
+	// up to a second for the event to land.
+	select {
+	case e := <-ch:
+		assert.Equal(t, EventUpdated, e.Kind)
+		assert.Equal(t, "drop", e.Device.Policy)
+	case <-time.After(time.Second):
+		t.Fatal("expected updated event after SetPolicy")
+	}
+
+	d, _ := s.Get(mac("aa:bb:cc:dd:ee:01"))
+	assert.Equal(t, "drop", d.Policy)
+}

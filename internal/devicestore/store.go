@@ -58,6 +58,32 @@ func New() *Store {
 	return &Store{byMAC: make(map[string]*Device), subs: map[chan Event]struct{}{}}
 }
 
+// copyDevice returns a deep copy of d so callers can't mutate store-internal
+// slice memory. MAC and IP are []byte slice headers; without this every
+// returned Device aliases the byMAC entry.
+func copyDevice(d Device) Device {
+	out := d
+	if d.MAC != nil {
+		out.MAC = append(net.HardwareAddr{}, d.MAC...)
+	}
+	if d.IP != nil {
+		out.IP = append(net.IP{}, d.IP...)
+	}
+	return out
+}
+
+// trySend is broadcast's per-subscriber send wrapper. It recovers from a
+// panic if a misbehaving caller closed the channel themselves — the daemon
+// survives, the bad subscriber simply stops receiving events.
+func trySend(ch chan Event, e Event) {
+	defer func() { _ = recover() }()
+	select {
+	case ch <- e:
+	default:
+		// drop on full buffer; the consumer is slow
+	}
+}
+
 // Upsert merges an observation into the store. New MAC = discovery; existing
 // MAC = update (only non-empty fields overwrite).
 func (s *Store) Upsert(o Observation) {
@@ -83,7 +109,7 @@ func (s *Store) Upsert(o Observation) {
 	if !o.Seen.IsZero() {
 		d.LastSeen = o.Seen
 	}
-	snapshot := *d
+	snapshot := copyDevice(*d)
 	s.mu.Unlock()
 
 	kind := EventUpdated
@@ -101,7 +127,7 @@ func (s *Store) Get(m net.HardwareAddr) (Device, bool) {
 	if !ok {
 		return Device{}, false
 	}
-	return *d, true
+	return copyDevice(*d), true
 }
 
 // ResolveIP looks up the MAC currently associated with the given IP.
@@ -123,7 +149,7 @@ func (s *Store) List() []Device {
 	defer s.mu.RUnlock()
 	out := make([]Device, 0, len(s.byMAC))
 	for _, d := range s.byMAC {
-		out = append(out, *d)
+		out = append(out, copyDevice(*d))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return bytes.Compare(out[i].IP, out[j].IP) < 0
@@ -141,15 +167,18 @@ func (s *Store) SetPolicy(m net.HardwareAddr, p any) bool {
 		return false
 	}
 	d.Policy = p
-	snapshot := *d
+	snapshot := copyDevice(*d)
 	go s.broadcast(Event{Kind: EventUpdated, Device: snapshot})
 	return true
 }
 
-// Subscribe returns a channel that receives every event. Buffer size 64 —
-// slow consumers drop oldest events (best-effort). Caller should call
-// Unsubscribe with the returned channel when done to avoid a goroutine
-// leak.
+// Subscribe returns a channel that receives every event. Buffer size 64.
+// When a slow consumer's buffer fills, the newest incoming event is
+// dropped (the existing buffered events stay queued). Caller MUST call
+// Unsubscribe with the returned channel when done — the channel is
+// bidirectional only because Unsubscribe needs to close it; callers must
+// not close it themselves (broadcast will recover, but the subscriber
+// then silently stops receiving).
 func (s *Store) Subscribe() chan Event {
 	ch := make(chan Event, 64)
 	s.subsMu.Lock()
@@ -174,10 +203,6 @@ func (s *Store) broadcast(e Event) {
 	s.subsMu.Lock()
 	defer s.subsMu.Unlock()
 	for ch := range s.subs {
-		select {
-		case ch <- e:
-		default:
-			// drop on full buffer; the consumer is slow
-		}
+		trySend(ch, e)
 	}
 }
