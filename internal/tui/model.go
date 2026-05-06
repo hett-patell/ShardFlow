@@ -106,11 +106,11 @@ func (m model) View() string {
 	for i, d := range m.devices {
 		marker := "  "
 		if i == m.cursor {
-			marker = "> "
+			marker = "▶ "
 		}
 		policy := d.policy
 		if policy == "" {
-			policy = "-"
+			policy = "—"
 		}
 		left.WriteString(fmt.Sprintf("%s%-15s %-12s %-20s [%s]\n", marker, d.ip, d.mac, d.hostname, policy))
 	}
