@@ -113,21 +113,29 @@ func policyListCmd() *cobra.Command {
 	}
 }
 
-// parseRate accepts "200kbit", "1mbit", "500kbps" → kbit.
+// parseRate accepts "200kbit", "1mbit", "500kbps", "2mbps" → kbit.
+// kbit/kbps and mbit/mbps follow networking SI convention (1 mbit = 1000 kbit).
+// A unit suffix is required; bare numbers and zero/negative rates are rejected.
 func parseRate(s string) (int, error) {
 	s = strings.ToLower(strings.TrimSpace(s))
-	mul := 1
+	mul := 0
 	num := s
 	switch {
 	case strings.HasSuffix(s, "kbit"), strings.HasSuffix(s, "kbps"):
 		num = s[:len(s)-4]
+		mul = 1
 	case strings.HasSuffix(s, "mbit"), strings.HasSuffix(s, "mbps"):
 		num = s[:len(s)-4]
-		mul = 1024
+		mul = 1000 // SI: 1 mbit = 1000 kbit
+	default:
+		return 0, fmt.Errorf("bad rate %q: expected suffix kbit, mbit, kbps, or mbps", s)
 	}
 	n, err := strconv.Atoi(num)
 	if err != nil {
-		return 0, fmt.Errorf("bad rate %q", s)
+		return 0, fmt.Errorf("bad rate %q: %w", s, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("bad rate %q: must be a positive integer", s)
 	}
 	return n * mul, nil
 }
