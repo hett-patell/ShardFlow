@@ -525,14 +525,31 @@ func renderAttackPanel(innerWidth int) string {
 	body := strings.Builder{}
 	body.WriteString(panelTitle.Render("┳ ATTACK") + "\n")
 
-	row1 := keyChipDanger.Render(" D ") + " " + keyDesc.Render("DROP — cut traffic to/from device") + "      " +
-		keyChipWarn.Render(" T ") + " " + keyDesc.Render("THROTTLE — rate-limit (default 200kbit)")
-	row2 := keyChipInfo.Render(" P ") + " " + keyDesc.Render("PCAP — passive capture to .pcapng") + "    " +
-		keyChip.Render(" C ") + " " + keyDesc.Render("CLEAR — restore device, send corrective ARP")
+	// Pad each left-cell to a fixed visible width so the right-cell's chip
+	// starts at the same column on both rows. Without this the right
+	// chips (T, C) drift because their left-cell descriptions differ in
+	// length.
+	const cellW = 48
 
-	body.WriteString(" " + row1 + "\n")
-	body.WriteString(" " + row2)
+	leftD := padCell(keyChipDanger.Render(" D ")+" "+keyDesc.Render("DROP — cut traffic to/from device"), cellW)
+	leftP := padCell(keyChipInfo.Render(" P ")+" "+keyDesc.Render("PCAP — passive capture to .pcapng"), cellW)
+
+	rightT := keyChipWarn.Render(" T ") + " " + keyDesc.Render("THROTTLE — rate-limit (default 200kbit)")
+	rightC := keyChip.Render(" C ") + " " + keyDesc.Render("CLEAR — restore device, send corrective ARP")
+
+	body.WriteString(" " + leftD + rightT + "\n")
+	body.WriteString(" " + leftP + rightC)
 	return panelBox.Width(innerWidth).Render(body.String())
+}
+
+// padCell pads s with trailing spaces until its visible width (ignoring
+// ANSI escapes) is at least w. Used to align columns in mixed-style rows.
+func padCell(s string, w int) string {
+	have := lipgloss.Width(s)
+	if have >= w {
+		return s
+	}
+	return s + strings.Repeat(" ", w-have)
 }
 
 func renderLogPanel(m model, innerWidth int) string {
