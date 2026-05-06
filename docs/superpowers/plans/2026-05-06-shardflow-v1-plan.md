@@ -4570,7 +4570,7 @@ func run() (err error) {
 	// Forward declaration so the broadcaster closure can refer to srv
 	// before it is constructed (Go closures capture by reference).
 	var srv *rpc.Server
-	handlers := rpc.BuildHandlers(rpc.HandlerDeps{
+	handlers := rpc.BuildHandlers(&rpc.HandlerDeps{
 		Store:    store,
 		Compiler: comp,
 		Scanner:  scanner,
