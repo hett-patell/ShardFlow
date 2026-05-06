@@ -98,7 +98,7 @@ func applyPolicyCmd(c *rpc.Client, target string, key rune, defaultRateKbit int,
 		if err := c.Call(context.Background(), rpc.MethodPolicySet, spec, &r); err != nil {
 			return eventMsg{text: fmt.Sprintf("policy %s %s: %s", target, spec.Kind, err)}
 		}
-		return eventMsg{text: fmt.Sprintf("policy %s -> %s", target, spec.Kind), refreshDevices: true}
+		return eventMsg{text: fmt.Sprintf("policy %s → %s", target, spec.Kind), refreshDevices: true}
 	}
 }
 
