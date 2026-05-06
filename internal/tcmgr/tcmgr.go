@@ -59,26 +59,36 @@ func classIDFor(mark uint32) string {
 
 // EnsureIFB creates shardflow0 (idempotent), sets it up, attaches root HTB.
 func (m *Manager) EnsureIFB(ctx context.Context) error {
-	_, _ = m.r.Run(ctx, "ip", argvAddIFB(IFBName))
-	if _, err := m.r.Run(ctx, "ip", argvSetUp(IFBName)); err != nil {
-		return err
+	if out, err := m.r.Run(ctx, "ip", argvAddIFB(IFBName)); err != nil && !isExisting(out) {
+		return fmt.Errorf("add ifb: %w", err)
 	}
-	_, _ = m.r.Run(ctx, "tc", argvAddRootHTB(IFBName))
+	if _, err := m.r.Run(ctx, "ip", argvSetUp(IFBName)); err != nil {
+		return fmt.Errorf("set up ifb: %w", err)
+	}
+	if out, err := m.r.Run(ctx, "tc", argvAddRootHTB(IFBName)); err != nil && !isExisting(out) {
+		return fmt.Errorf("add root htb: %w", err)
+	}
 	return nil
 }
 
 // EnsureCaptureIface creates shardflow-cap (dummy) and brings it up. The
 // pcapwriter reads frames mirrored here.
 func (m *Manager) EnsureCaptureIface(ctx context.Context) error {
-	_, _ = m.r.Run(ctx, "ip", argvAddDummy(CaptureName))
-	_, err := m.r.Run(ctx, "ip", argvSetUp(CaptureName))
-	return err
+	if out, err := m.r.Run(ctx, "ip", argvAddDummy(CaptureName)); err != nil && !isExisting(out) {
+		return fmt.Errorf("add dummy: %w", err)
+	}
+	if _, err := m.r.Run(ctx, "ip", argvSetUp(CaptureName)); err != nil {
+		return fmt.Errorf("set up dummy: %w", err)
+	}
+	return nil
 }
 
 // EnsureRedirect installs an ingress qdisc on the operator's real iface so
 // later filters have somewhere to attach. Idempotent.
 func (m *Manager) EnsureRedirect(ctx context.Context, realIface string) error {
-	_, _ = m.r.Run(ctx, "tc", argvAddIngressQdisc(realIface))
+	if out, err := m.r.Run(ctx, "tc", argvAddIngressQdisc(realIface)); err != nil && !isExisting(out) {
+		return fmt.Errorf("add ingress qdisc on %s: %w", realIface, err)
+	}
 	return nil
 }
 
@@ -168,6 +178,17 @@ func (m *Manager) Teardown(ctx context.Context) error {
 // being deleted didn't exist — treated as success (idempotent cleanup).
 func isMissing(out []byte) bool {
 	for _, marker := range []string{"Cannot find", "does not exist", "No such file", "RTNETLINK answers: No such"} {
+		if bytes.Contains(out, []byte(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
+// isExisting returns true when iproute2/tc/ip output indicates the object
+// being added already exists — treated as success (idempotent setup).
+func isExisting(out []byte) bool {
+	for _, marker := range []string{"File exists", "already exists", "Exclusivity flag"} {
 		if bytes.Contains(out, []byte(marker)) {
 			return true
 		}

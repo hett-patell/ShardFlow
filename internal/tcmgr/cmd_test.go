@@ -25,21 +25,28 @@ func TestArgvAddIngressQdisc(t *testing.T) {
 
 func TestArgvAddRedirectFilter(t *testing.T) {
 	got := argvAddRedirectFilter("eth0", 42, "shardflow0")
-	assert.Contains(t, got, "filter")
-	assert.Contains(t, got, "fw")
-	assert.Contains(t, got, "redirect")
-	assert.Contains(t, got, "shardflow0")
+	assert.Equal(t, []string{
+		"filter", "add", "dev", "eth0", "parent", "ffff:",
+		"protocol", "all", "prio", "1",
+		"handle", "42", "fw",
+		"action", "mirred", "egress", "redirect", "dev", "shardflow0",
+	}, got)
 }
 
 func TestArgvAddMirrorFilter(t *testing.T) {
 	got := argvAddMirrorFilter("eth0", 42, "shardflow-cap")
-	assert.Contains(t, got, "mirror")
-	assert.Contains(t, got, "shardflow-cap")
+	assert.Equal(t, []string{
+		"filter", "add", "dev", "eth0", "parent", "ffff:",
+		"protocol", "all", "prio", "2",
+		"handle", "42", "fw",
+		"action", "mirred", "egress", "mirror", "dev", "shardflow-cap",
+	}, got)
 }
 
 func TestArgvAddHTBClass(t *testing.T) {
 	got := argvAddHTBClass("shardflow0", "1:42", "200kbit")
-	assert.Contains(t, got, "class")
-	assert.Contains(t, got, "200kbit")
-	assert.Contains(t, got, "1:42")
+	assert.Equal(t, []string{
+		"class", "add", "dev", "shardflow0", "parent", "1:", "classid", "1:42",
+		"htb", "rate", "200kbit", "ceil", "200kbit",
+	}, got)
 }
