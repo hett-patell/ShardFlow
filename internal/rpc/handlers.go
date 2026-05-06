@@ -44,6 +44,21 @@ type HandlerDeps struct {
 	// that only makes each Apply atomic — it doesn't cover the handler-
 	// level RMW.
 	applyMu sync.Mutex
+
+	// shuttingDown, set under applyMu before shutdown begins, prevents
+	// new Policy.Set / Policy.Clear from racing the corrective-ARP path.
+	// Spec §9.1: every active poison must receive corrective ARPs before
+	// daemon exit; a setPolicy that lands between Apply(empty) and
+	// arp.StopAll would otherwise leave the new target uncorrected.
+	shuttingDown bool
+}
+
+// MarkShuttingDown blocks new Policy.Set/Policy.Clear handler invocations.
+// Called from the daemon's signal handler before tearing down state.
+func (d *HandlerDeps) MarkShuttingDown() {
+	d.applyMu.Lock()
+	d.shuttingDown = true
+	d.applyMu.Unlock()
 }
 
 // BuildHandlers returns the method table from a HandlerDeps. The deps are
@@ -154,6 +169,10 @@ func setPolicy(ctx context.Context, d *HandlerDeps, p PolicySpec) (any, *Error) 
 	// Serialise the RMW: another handler invocation cannot Snapshot before
 	// our Apply commits.
 	d.applyMu.Lock()
+	if d.shuttingDown {
+		d.applyMu.Unlock()
+		return nil, &Error{Code: CodeInternalError, Message: "daemon shutting down"}
+	}
 	desired := d.Compiler.Snapshot()
 	desired[mac.String()] = spec
 	err := d.Compiler.Apply(ctx, desired)
@@ -177,6 +196,10 @@ func clearPolicy(ctx context.Context, d *HandlerDeps, target string) (any, *Erro
 	}
 
 	d.applyMu.Lock()
+	if d.shuttingDown {
+		d.applyMu.Unlock()
+		return nil, &Error{Code: CodeInternalError, Message: "daemon shutting down"}
+	}
 	desired := d.Compiler.Snapshot()
 	delete(desired, mac.String())
 	err := d.Compiler.Apply(ctx, desired)

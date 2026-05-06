@@ -98,8 +98,15 @@ func run() (err error) {
 		}
 	}()
 
-	// Forward-declare srv so the signal handler closure can reference it.
-	var srv *rpc.Server
+	// Forward-declare srv and deps so the signal handler closure can
+	// reference them. deps is populated below so that MarkShuttingDown
+	// flips the shuttingDown flag before shutdown() runs — without this,
+	// a Policy.Set landing between Apply(empty) and arp.StopAll would
+	// leave the new target uncorrected (spec §9.1).
+	var (
+		srv  *rpc.Server
+		deps *rpc.HandlerDeps
+	)
 
 	// Signal handling installed BEFORE kernel-mutating EnsureX calls so a
 	// signal during startup triggers the same shutdown path instead of
@@ -110,6 +117,9 @@ func run() (err error) {
 	go func() {
 		<-sig
 		fmt.Fprintln(os.Stderr, "shardflowd: shutting down")
+		if deps != nil {
+			deps.MarkShuttingDown()
+		}
 		if srv != nil {
 			_ = srv.Stop()
 		}
@@ -152,7 +162,7 @@ func run() (err error) {
 		return nil
 	}
 
-	handlers := rpc.BuildHandlers(&rpc.HandlerDeps{
+	deps = &rpc.HandlerDeps{
 		Store:    store,
 		Compiler: comp,
 		Scanner:  scanner,
@@ -165,7 +175,8 @@ func run() (err error) {
 		},
 		ActivePoisons:  func() int { return len(arp.Active()) },
 		DefaultPcapDir: *defaultPcapDir,
-	})
+	}
+	handlers := rpc.BuildHandlers(deps)
 	srv = rpc.NewServer(handlers)
 
 	go func() {
