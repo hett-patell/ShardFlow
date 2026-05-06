@@ -19,7 +19,7 @@ func TestBuildPoisonReply(t *testing.T) {
 	tgtIP := net.ParseIP("10.0.0.42").To4()
 
 	// Poison reply telling target: "the gateway's MAC is opMAC".
-	frame, err := buildARPReply(opMAC, gwIP, tgtMAC, tgtIP)
+	frame, err := buildARPReply(opMAC, opMAC, gwIP, tgtMAC, tgtIP)
 	require.NoError(t, err)
 
 	pkt := gopacket.NewPacket(frame, layers.LayerTypeEthernet, gopacket.Default)

