@@ -64,11 +64,16 @@ That's it. You're in the matrix. Hit `s` to scan, `j/k` to navigate,
 pretend none of this happened — corrective ARPs are sent automatically so
 your victims regain functioning networks.
 
-If you want to pick a specific interface or socket path:
+If you want to pick a specific interface, socket path, or crank the
+poison cadence for stubborn modern phones:
 
 ```bash
-sudo ./scripts/shardflow-up -i wlp3s0 -s /tmp/sf.sock
+sudo ./scripts/shardflow-up -i wlp3s0 -s /tmp/sf.sock -c 50ms
 ```
+
+`-c 50ms` makes the daemon fire ~80 ARP frames/sec/target instead of the
+default ~4. Use this for iOS 16+, hardened Android, or any device whose
+kernel auto-refreshes its ARP cache faster than 1 Hz.
 
 ### The hard way (manual)
 

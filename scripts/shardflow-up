@@ -11,25 +11,31 @@ set -euo pipefail
 IFACE=""
 SOCK="/tmp/sf.sock"
 PCAP_DIR="/tmp/sf-pcap"
+CADENCE=""
 
 usage() {
     cat <<EOF
 shardflow-up — boot the daemon and TUI together.
 
-Usage: sudo $0 [-i <iface>] [-s <sock>]
+Usage: sudo $0 [-i <iface>] [-s <sock>] [-c <cadence>]
 
-  -i <iface>   network interface to operate on (default: auto-detect)
-  -s <sock>    Unix socket path (default: $SOCK)
-  -h           this help
+  -i <iface>     network interface to operate on (default: auto-detect)
+  -s <sock>      Unix socket path (default: $SOCK)
+  -c <cadence>   ARP poison cadence (e.g. 200ms, 50ms). Default 1s in the
+                 daemon. Lower = more aggressive (use 50ms for stubborn
+                 modern phones); cost is a slower 'policy clear' since
+                 the corrective has to flood harder to win the cache back.
+  -h             this help
 
 Hit q in the TUI to exit. The daemon is torn down automatically.
 EOF
 }
 
-while getopts "i:s:h" opt; do
+while getopts "i:s:c:h" opt; do
     case "$opt" in
         i) IFACE="$OPTARG" ;;
         s) SOCK="$OPTARG" ;;
+        c) CADENCE="$OPTARG" ;;
         h) usage; exit 0 ;;
         *) usage; exit 2 ;;
     esac
@@ -87,8 +93,13 @@ trap cleanup EXIT INT TERM
 # trample on the TUI's screen.
 LOG_FILE="$(mktemp -t shardflowd-XXXXXX.log)"
 echo "shardflow-up: starting daemon — log: $LOG_FILE"
-"$DAEMON" -i "$IFACE" -sock "$SOCK" --force --clean-on-start \
-    -default-pcap-dir "$PCAP_DIR" >"$LOG_FILE" 2>&1 &
+DAEMON_ARGS=(-i "$IFACE" -sock "$SOCK" --force --clean-on-start
+             -default-pcap-dir "$PCAP_DIR")
+if [[ -n "$CADENCE" ]]; then
+    DAEMON_ARGS+=(-poison-cadence "$CADENCE")
+    echo "shardflow-up: poison cadence override = $CADENCE"
+fi
+"$DAEMON" "${DAEMON_ARGS[@]}" >"$LOG_FILE" 2>&1 &
 DAEMON_PID=$!
 
 # Wait for the socket to actually appear AND be reachable.
