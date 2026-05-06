@@ -3,6 +3,7 @@ package arpengine
 import (
 	"net"
 	"testing"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -29,4 +30,11 @@ func TestBuildPoisonReply(t *testing.T) {
 	assert.Equal(t, tgtMAC.String(), net.HardwareAddr(arp.DstHwAddress).String())
 	assert.Equal(t, tgtIP.String(), net.IP(arp.DstProtAddress).String())
 	_ = gwMAC // gwMAC is for the symmetric "tell the gateway" frame; tested separately
+}
+
+func TestStopAllUnknownTargetsIsNil(t *testing.T) {
+	// StopAll on an empty engine returns nil (no errors to aggregate).
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:01")
+	e := New("lo", mac, time.Millisecond)
+	require.NoError(t, e.StopAll())
 }
