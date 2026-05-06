@@ -98,6 +98,25 @@ func run() (err error) {
 		}
 	}()
 
+	// Forward-declare srv so the signal handler closure can reference it.
+	var srv *rpc.Server
+
+	// Signal handling installed BEFORE kernel-mutating EnsureX calls so a
+	// signal during startup triggers the same shutdown path instead of
+	// orphaning newly-created kernel state. The srv != nil guard handles
+	// the window before srv = rpc.NewServer(...) is assigned.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		fmt.Fprintln(os.Stderr, "shardflowd: shutting down")
+		if srv != nil {
+			_ = srv.Stop()
+		}
+		shutdown()
+		cancel()
+	}()
+
 	if err := nft.EnsureTables(ctx, info.Name); err != nil {
 		return err
 	}
@@ -133,7 +152,6 @@ func run() (err error) {
 		return nil
 	}
 
-	var srv *rpc.Server
 	handlers := rpc.BuildHandlers(&rpc.HandlerDeps{
 		Store:    store,
 		Compiler: comp,
@@ -152,19 +170,28 @@ func run() (err error) {
 
 	go func() {
 		ch := store.Subscribe()
-		for ev := range ch {
-			method := rpc.EventDeviceUpdated
-			if ev.Kind == devicestore.EventDiscovered {
-				method = rpc.EventDeviceDiscovered
+		defer store.Unsubscribe(ch)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev, ok := <-ch:
+				if !ok {
+					return
+				}
+				method := rpc.EventDeviceUpdated
+				if ev.Kind == devicestore.EventDiscovered {
+					method = rpc.EventDeviceDiscovered
+				}
+				dto := rpc.DeviceDTO{
+					MAC:      ev.Device.MAC.String(),
+					IP:       ev.Device.IP.String(),
+					Hostname: ev.Device.Hostname,
+					Vendor:   ev.Device.Vendor,
+					LastSeen: ev.Device.LastSeen.Format(time.RFC3339),
+				}
+				srv.Broadcast(method, dto)
 			}
-			dto := rpc.DeviceDTO{
-				MAC:      ev.Device.MAC.String(),
-				IP:       ev.Device.IP.String(),
-				Hostname: ev.Device.Hostname,
-				Vendor:   ev.Device.Vendor,
-				LastSeen: ev.Device.LastSeen.Format(time.RFC3339),
-			}
-			srv.Broadcast(method, dto)
 		}
 	}()
 
@@ -179,16 +206,6 @@ func run() (err error) {
 				srv.Broadcast(rpc.EventCountersTick, map[string]any{"ts": time.Now().Unix()})
 			}
 		}
-	}()
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sig
-		fmt.Fprintln(os.Stderr, "shardflowd: shutting down")
-		_ = srv.Stop()
-		shutdown()
-		cancel()
 	}()
 
 	if err := srv.Listen(ctx, *sockFlag); err != nil {
