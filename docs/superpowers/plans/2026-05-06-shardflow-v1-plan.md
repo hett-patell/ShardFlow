@@ -2525,18 +2525,21 @@ trailers.)
 func parseRuleHandlesForMAC(out []byte, mac net.HardwareAddr) []string {
 	// nft -a output line examples:
 	//   ether saddr aa:bb:cc:dd:ee:01 drop comment "shardflow:aa:bb:cc:dd:ee:01" # handle 7
-	tag := "shardflow:" + mac.String()
+	// Match the exact nft-printed comment form including double-quotes so
+	// user comments containing the substring don't false-match.
+	tag := `"shardflow:` + mac.String() + `"`
 	var handles []string
 	for _, line := range bytes.Split(out, []byte("\n")) {
 		s := string(line)
-		if !contains(s, tag) || !contains(s, "# handle ") {
+		if !strings.Contains(s, tag) || !strings.Contains(s, "# handle ") {
 			continue
 		}
-		idx := indexOf(s, "# handle ")
-		if idx < 0 {
+		idx := strings.Index(s, "# handle ")
+		fs := strings.Fields(s[idx+len("# handle "):])
+		if len(fs) == 0 {
 			continue
 		}
-		handles = append(handles, fields(s[idx+len("# handle "):])[0])
+		handles = append(handles, fs[0])
 	}
 	return handles
 }
