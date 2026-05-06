@@ -52,13 +52,16 @@ func run() (err error) {
 	if err != nil {
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "shardflowd: iface=%s ip=%s mac=%s gw=%s\n", info.Name, info.IP, info.HwAddr, info.Gateway)
 	if info.Gateway == nil {
 		return fmt.Errorf("could not determine IPv4 default gateway on %s", info.Name)
 	}
 
+	fmt.Fprintln(os.Stderr, "shardflowd: preflight")
 	if err := preflight(*sockFlag, info.Name, *forceFlag, *cleanFlag); err != nil {
 		return err
 	}
+	fmt.Fprintln(os.Stderr, "shardflowd: enable forwarding")
 	prevForward, err := setIPv4Forward("1")
 	if err != nil {
 		return fmt.Errorf("enable forwarding: %w", err)
@@ -67,10 +70,22 @@ func run() (err error) {
 		_, _ = setIPv4Forward(prevForward)
 	}()
 
+	fmt.Fprintln(os.Stderr, "shardflowd: disable ICMP send_redirects")
+	prevRedirAll, prevRedirIface, err := disableSendRedirects(info.Name)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_, _ = writeSysctl("/proc/sys/net/ipv4/conf/all/send_redirects", prevRedirAll)
+		_, _ = writeSysctl("/proc/sys/net/ipv4/conf/"+info.Name+"/send_redirects", prevRedirIface)
+	}()
+
+	fmt.Fprintln(os.Stderr, "shardflowd: resolving gateway MAC...")
 	gwMAC, err := resolveGatewayMAC(info)
 	if err != nil {
 		return fmt.Errorf("resolve gateway MAC: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "shardflowd: gateway MAC = %s\n", gwMAC)
 
 	store := devicestore.New()
 	nft := nftmgr.New()
@@ -127,15 +142,19 @@ func run() (err error) {
 		cancel()
 	}()
 
+	fmt.Fprintln(os.Stderr, "shardflowd: nft.EnsureTables")
 	if err := nft.EnsureTables(ctx, info.Name); err != nil {
 		return err
 	}
+	fmt.Fprintln(os.Stderr, "shardflowd: tcm.EnsureIFB")
 	if err := tcm.EnsureIFB(ctx); err != nil {
 		return err
 	}
+	fmt.Fprintln(os.Stderr, "shardflowd: tcm.EnsureCaptureIface")
 	if err := tcm.EnsureCaptureIface(ctx); err != nil {
 		return err
 	}
+	fmt.Fprintln(os.Stderr, "shardflowd: tcm.EnsureRedirect")
 	if err := tcm.EnsureRedirect(ctx, info.Name); err != nil {
 		return err
 	}
@@ -219,6 +238,7 @@ func run() (err error) {
 		}
 	}()
 
+	fmt.Fprintf(os.Stderr, "shardflowd: listening on %s\n", *sockFlag)
 	if err := srv.Listen(ctx, *sockFlag); err != nil {
 		return err
 	}
