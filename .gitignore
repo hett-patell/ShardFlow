@@ -1,0 +1,5 @@
+# Local plugin state, not part of the project.
+.remember/
+
+# Build artifacts (Task 0.1 will add the rest of these later in a real
+# .gitignore committed alongside go.mod; this file is just the baseline).
