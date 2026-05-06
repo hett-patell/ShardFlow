@@ -1416,7 +1416,9 @@ import (
 )
 
 // parseARP extracts a (MAC, IP, vendor) observation from an ARP reply or a
-// gratuitous ARP request. Returns ok=false if the packet isn't ARP.
+// gratuitous ARP request. Returns ok=false if the packet isn't ARP, or if
+// SPA is 0.0.0.0 (RFC 5227 ARP probe — the sender does not yet own the IP,
+// so recording it would clobber a previously known address).
 func parseARP(pkt gopacket.Packet) (devicestore.Observation, bool) {
 	l := pkt.Layer(layers.LayerTypeARP)
 	if l == nil {
@@ -1424,6 +1426,10 @@ func parseARP(pkt gopacket.Packet) (devicestore.Observation, bool) {
 	}
 	a := l.(*layers.ARP)
 	if len(a.SourceHwAddress) != 6 || len(a.SourceProtAddress) != 4 {
+		return devicestore.Observation{}, false
+	}
+	if a.SourceProtAddress[0] == 0 && a.SourceProtAddress[1] == 0 &&
+		a.SourceProtAddress[2] == 0 && a.SourceProtAddress[3] == 0 {
 		return devicestore.Observation{}, false
 	}
 	mac := net.HardwareAddr(append([]byte{}, a.SourceHwAddress...))
@@ -1435,8 +1441,10 @@ func parseARP(pkt gopacket.Packet) (devicestore.Observation, bool) {
 	}, true
 }
 
-// parseDHCP extracts (MAC, optional hostname) from a DHCP frame using the
-// client hardware address and option 12 (host name).
+// parseDHCP extracts (MAC, optional hostname, vendor) from a DHCP frame
+// using the client hardware address and option 12 (host name). Vendor is
+// populated via oui.Lookup so the first observation from DHCP doesn't
+// silently leave it blank.
 func parseDHCP(pkt gopacket.Packet) (devicestore.Observation, bool) {
 	l := pkt.Layer(layers.LayerTypeDHCPv4)
 	if l == nil {
@@ -1446,9 +1454,11 @@ func parseDHCP(pkt gopacket.Packet) (devicestore.Observation, bool) {
 	if len(d.ClientHWAddr) != 6 {
 		return devicestore.Observation{}, false
 	}
+	mac := net.HardwareAddr(append([]byte{}, d.ClientHWAddr...))
 	obs := devicestore.Observation{
-		MAC:  net.HardwareAddr(append([]byte{}, d.ClientHWAddr...)),
-		Seen: time.Now(),
+		MAC:    mac,
+		Vendor: oui.Lookup(mac),
+		Seen:   time.Now(),
 	}
 	for _, opt := range d.Options {
 		if opt.Type == layers.DHCPOptHostname {
