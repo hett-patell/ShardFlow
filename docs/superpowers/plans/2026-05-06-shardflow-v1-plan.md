@@ -30,6 +30,11 @@ Per-target rules are tagged with an nft `comment` of `shardflow:<mac>` so `nftmg
 **Implementer-discretion cleanups (apply if they read clean, ignore otherwise):**
 - `github.com/google/gopacket` is in maintenance mode; the active fork is `github.com/gopacket/gopacket`. Either works; if you choose the fork, change every `import` line consistently across all packages.
 
+**Spec deviations deferred to v1.1 (not implemented in v1; events are declared but not emitted):**
+- `iface.up` / `iface.down` events (declared in `rpc/types.go`) are not emitted in v1. Spec §10 specifies that policies be re-applied on `iface.up`; no goroutine in the daemon monitors interface state. The TUI's hint about "wlan0 down — N policies suspended" is therefore unreachable. Add an interface-watch goroutine in v1.1.
+- `pcap.rotated` event is declared but never emitted by `pcapwriter`. Add the broadcast in v1.1 — the rotation point in `runWriter.open()` is the obvious site.
+- `devicestore.SetPolicy(mac, any)` is exported but unused — the compiler's `current` map is the authoritative store of per-target policy state. Kept as preparatory surface for a future "policy displayed inline in device list via devicestore subscription" path; can be deleted in v1.1 if that path doesn't materialise.
+
 **Operator footguns (document in README, do not gate v1):**
 - `--clean-on-start` removes the **whole** ingress qdisc on the operator's real iface, not just ShardFlow's filters. Any unrelated `tc` filters another tool placed there are destroyed. This is acceptable for dedicated lab/test interfaces; on a workstation that has other tc state, run shardflowd in a netns or accept the loss.
 - `internal/scan/mdns` binds UDP port 5353 explicitly. On hosts running `avahi-daemon` (default on most desktop Linux distros) the bind fails with `EADDRINUSE`. Workarounds, in order of preference: stop avahi for the session (`systemctl stop avahi-daemon`), run shardflowd in a netns, or change the package to bind ephemeral with `SO_REUSEPORT`. Documented as a known v1 limitation.
@@ -185,7 +190,7 @@ fmt:
 	$(GO) fmt ./...
 
 lint: vet
-	@which golangci-lint > /dev/null && golangci-lint run || echo "(skipping golangci-lint, not installed)"
+	@if command -v golangci-lint >/dev/null 2>&1; then golangci-lint run; else echo "(skipping golangci-lint, not installed)"; fi
 
 clean:
 	rm -rf $(BIN_DIR) coverage.out coverage.html
@@ -704,7 +709,7 @@ func Lookup(m net.HardwareAddr) string {
 
 package oui
 
-//go:generate sh -c "curl -s https://standards-oui.ieee.org/oui/oui.txt | awk '/\\(base 16\\)/ { gsub(\"-\", \"\", $$1); print $$1, substr($$0, index($$0,\"(base 16)\")+11) }' > data/oui.txt"
+//go:generate sh -c "curl -s https://standards-oui.ieee.org/oui/oui.txt | awk '/\\(base 16\\)/ { gsub(\"-\", \"\", $1); print $1, substr($0, index($0,\"(base 16)\")+11) }' > data/oui.txt"
 ```
 
 - [ ] **Step 6: Run the tests, confirm they pass**
@@ -812,9 +817,11 @@ type Info struct {
 	Gateway net.IP     // best-effort IPv4 default gateway; nil if unknown
 }
 
-// Lookup returns Info for the named interface. The Gateway field is
-// populated by parsing `ip route show default`; if that fails, Gateway is nil
-// and the caller is expected to handle it.
+// Lookup returns Info for the named interface. On success, IP and IPNet
+// are always non-nil — Lookup returns an error if the interface has no
+// IPv4 address. The Gateway field is populated by parsing `ip route show
+// default`; if that fails, Gateway is nil and the caller is expected to
+// handle it (Gateway is best-effort, IP/IPNet are required).
 func Lookup(name string) (Info, error) {
 	netIf, err := net.InterfaceByName(name)
 	if err != nil {
@@ -827,12 +834,19 @@ func Lookup(name string) (Info, error) {
 	info := Info{Name: name, Index: netIf.Index, HwAddr: netIf.HardwareAddr}
 	for _, a := range addrs {
 		ipnet, ok := a.(*net.IPNet)
-		if !ok || ipnet.IP.To4() == nil {
+		if !ok {
 			continue
 		}
-		info.IP = ipnet.IP.To4()
-		info.IPNet = &net.IPNet{IP: info.IP, Mask: ipnet.Mask}
+		ip4 := ipnet.IP.To4()
+		if ip4 == nil {
+			continue
+		}
+		info.IP = ip4
+		info.IPNet = &net.IPNet{IP: ip4, Mask: ipnet.Mask}
 		break
+	}
+	if info.IP == nil {
+		return Info{}, fmt.Errorf("iface %s: no IPv4 address", name)
 	}
 	info.Gateway = defaultGateway(name)
 	return info, nil
@@ -1170,6 +1184,10 @@ import (
 // Sweep sends ARP requests for every host in cidr from the operator's
 // (srcMAC, srcIP) on the given iface, listens for replies for window, and
 // invokes onObs for each reply.
+//
+// onObs is invoked from a dedicated listener goroutine; it must be safe
+// for concurrent use. Sweep returns only after the listener goroutine has
+// exited, so onObs is never called after Sweep returns.
 func Sweep(ctx context.Context, ifaceName string, srcMAC net.HardwareAddr, srcIP net.IP, cidr *net.IPNet, window time.Duration, onObs func(devicestore.Observation)) error {
 	handle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
 	if err != nil {
@@ -1180,10 +1198,16 @@ func Sweep(ctx context.Context, ifaceName string, srcMAC net.HardwareAddr, srcIP
 		return fmt.Errorf("bpf: %w", err)
 	}
 
-	// Listener goroutine.
 	listenCtx, cancelListen := context.WithCancel(ctx)
-	defer cancelListen()
 	var wg sync.WaitGroup
+	// Defers fire LIFO, so on return the order is cancelListen → wg.Wait
+	// → handle.Close. The listener goroutine exits when listenCtx is
+	// cancelled; wg.Wait then blocks until that exit completes; only then
+	// is the pcap handle closed. Covers every early-return path (BPF
+	// setup, send errors) as well as normal window-expiry.
+	defer wg.Wait()
+	defer cancelListen()
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1214,8 +1238,14 @@ func Sweep(ctx context.Context, ifaceName string, srcMAC net.HardwareAddr, srcIP
 		}
 	}()
 
-	// Sender: blast one request per host in the CIDR.
+	// Sender: blast one request per host in the CIDR. Respects ctx so a
+	// cancelled sweep doesn't keep flushing the entire CIDR.
 	for ip := nextIP(cidr.IP.Mask(cidr.Mask)); cidr.Contains(ip); ip = nextIP(ip) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		frame, err := buildARPRequest(srcMAC, srcIP, ip)
 		if err != nil {
 			return err
@@ -1226,12 +1256,12 @@ func Sweep(ctx context.Context, ifaceName string, srcMAC net.HardwareAddr, srcIP
 	}
 
 	// Wait for either window expiry or context cancellation.
+	timer := time.NewTimer(window)
+	defer timer.Stop()
 	select {
-	case <-time.After(window):
+	case <-timer.C:
 	case <-ctx.Done():
 	}
-	cancelListen()
-	wg.Wait()
 	return nil
 }
 
@@ -1391,7 +1421,9 @@ import (
 )
 
 // parseARP extracts a (MAC, IP, vendor) observation from an ARP reply or a
-// gratuitous ARP request. Returns ok=false if the packet isn't ARP.
+// gratuitous ARP request. Returns ok=false if the packet isn't ARP, or if
+// SPA is 0.0.0.0 (RFC 5227 ARP probe — the sender does not yet own the IP,
+// so recording it would clobber a previously known address).
 func parseARP(pkt gopacket.Packet) (devicestore.Observation, bool) {
 	l := pkt.Layer(layers.LayerTypeARP)
 	if l == nil {
@@ -1399,6 +1431,10 @@ func parseARP(pkt gopacket.Packet) (devicestore.Observation, bool) {
 	}
 	a := l.(*layers.ARP)
 	if len(a.SourceHwAddress) != 6 || len(a.SourceProtAddress) != 4 {
+		return devicestore.Observation{}, false
+	}
+	if a.SourceProtAddress[0] == 0 && a.SourceProtAddress[1] == 0 &&
+		a.SourceProtAddress[2] == 0 && a.SourceProtAddress[3] == 0 {
 		return devicestore.Observation{}, false
 	}
 	mac := net.HardwareAddr(append([]byte{}, a.SourceHwAddress...))
@@ -1410,8 +1446,10 @@ func parseARP(pkt gopacket.Packet) (devicestore.Observation, bool) {
 	}, true
 }
 
-// parseDHCP extracts (MAC, optional hostname) from a DHCP frame using the
-// client hardware address and option 12 (host name).
+// parseDHCP extracts (MAC, optional hostname, vendor) from a DHCP frame
+// using the client hardware address and option 12 (host name). Vendor is
+// populated via oui.Lookup so the first observation from DHCP doesn't
+// silently leave it blank.
 func parseDHCP(pkt gopacket.Packet) (devicestore.Observation, bool) {
 	l := pkt.Layer(layers.LayerTypeDHCPv4)
 	if l == nil {
@@ -1421,9 +1459,11 @@ func parseDHCP(pkt gopacket.Packet) (devicestore.Observation, bool) {
 	if len(d.ClientHWAddr) != 6 {
 		return devicestore.Observation{}, false
 	}
+	mac := net.HardwareAddr(append([]byte{}, d.ClientHWAddr...))
 	obs := devicestore.Observation{
-		MAC:  net.HardwareAddr(append([]byte{}, d.ClientHWAddr...)),
-		Seen: time.Now(),
+		MAC:    mac,
+		Vendor: oui.Lookup(mac),
+		Seen:   time.Now(),
 	}
 	for _, opt := range d.Options {
 		if opt.Type == layers.DHCPOptHostname {
@@ -1576,23 +1616,33 @@ const (
 	queryFor = "_services._dns-sd._udp.local."
 )
 
-// Query sends a single mDNS-SD PTR query and listens for window. Each A or
-// AAAA record observed in a response is passed to onObs.
+// Query sends a single mDNS-SD PTR query on the named interface and listens
+// for window. Each A record observed in a response is passed to onObs.
+//
+// Note: binds UDP/5353 explicitly — fails with EADDRINUSE on hosts running
+// avahi-daemon. Documented v1 limitation.
 func Query(ctx context.Context, ifaceName string, window time.Duration, onObs func(devicestore.Observation)) error {
-	addr, err := net.ResolveUDPAddr("udp4", mdnsAddr)
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return fmt.Errorf("resolve interface %q: %w", ifaceName, err)
+	}
+	groupAddr, err := net.ResolveUDPAddr("udp4", mdnsAddr)
 	if err != nil {
 		return err
 	}
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 5353})
+	// ListenMulticastUDP joins 224.0.0.251 on the named iface
+	// (IP_ADD_MEMBERSHIP) and sets IP_MULTICAST_IF, so responses from
+	// devices on that segment are delivered even when no other process
+	// holds the group membership (e.g., when avahi-daemon is stopped).
+	conn, err := net.ListenMulticastUDP("udp4", iface, &net.UDPAddr{IP: net.ParseIP("224.0.0.251"), Port: 5353})
 	if err != nil {
-		return fmt.Errorf("listen: %w", err)
+		return fmt.Errorf("listen multicast: %w", err)
 	}
 	defer conn.Close()
-	if _, err := conn.WriteTo(buildQuery(queryFor), addr); err != nil {
+	if _, err := conn.WriteTo(buildQuery(queryFor), groupAddr); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(window)
-	if err := conn.SetReadDeadline(deadline); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(window)); err != nil {
 		return err
 	}
 	buf := make([]byte, 65536)
@@ -1609,9 +1659,7 @@ func Query(ctx context.Context, ifaceName string, window time.Duration, onObs fu
 			}
 			return err
 		}
-		if obs, ok := parseMDNS(buf[:n], src); ok {
-			onObs(obs)
-		}
+		parseMDNS(buf[:n], src, onObs)
 	}
 }
 
@@ -1627,18 +1675,22 @@ func buildQuery(name string) []byte {
 	return b
 }
 
-func parseMDNS(pkt []byte, src *net.UDPAddr) (devicestore.Observation, bool) {
+// parseMDNS extracts every A record in the response and calls onObs once
+// per record. Non-A answers are skipped. Callback shape (rather than
+// returning a single Observation) so multi-A responses don't drop records.
+func parseMDNS(pkt []byte, src *net.UDPAddr, onObs func(devicestore.Observation)) {
+	_ = src
 	var p dnsmessage.Parser
 	if _, err := p.Start(pkt); err != nil {
-		return devicestore.Observation{}, false
+		return
 	}
 	if err := p.SkipAllQuestions(); err != nil {
-		return devicestore.Observation{}, false
+		return
 	}
 	for {
 		h, err := p.AnswerHeader()
 		if err != nil {
-			break
+			return
 		}
 		switch h.Type {
 		case dnsmessage.TypeA:
@@ -1646,19 +1698,18 @@ func parseMDNS(pkt []byte, src *net.UDPAddr) (devicestore.Observation, bool) {
 			if err != nil {
 				continue
 			}
-			return devicestore.Observation{
+			onObs(devicestore.Observation{
 				Hostname: trimDot(h.Name.String()),
-				IP:       net.IP(r.A[:]),
-				Seen:     time.Now(),
-			}, true
+				// Copy A bytes; r.A lives on the parser's stack storage.
+				IP:   net.IP{r.A[0], r.A[1], r.A[2], r.A[3]},
+				Seen: time.Now(),
+			})
 		default:
 			if err := p.SkipAnswer(); err != nil {
-				return devicestore.Observation{}, false
+				return
 			}
 		}
 	}
-	_ = src
-	return devicestore.Observation{}, false
 }
 
 func trimDot(s string) string { return strings.TrimSuffix(s, ".") }
@@ -1690,6 +1741,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/ipv4"
+
 	"github.com/hett-patell/ShardFlow/internal/devicestore"
 )
 
@@ -1701,10 +1754,14 @@ const mSearchTemplate = "M-SEARCH * HTTP/1.1\r\n" +
 	"MX: 2\r\n" +
 	"ST: ssdp:all\r\n\r\n"
 
-// Query sends one M-SEARCH and listens for window. Each response with a
-// usable SERVER header produces an observation keyed by the source IP
-// (note: caller resolves IP→MAC via devicestore later).
+// Query sends one M-SEARCH on the named interface and listens for window.
+// Each response with a usable SERVER header produces an observation keyed
+// by the source IP (caller resolves IP→MAC via devicestore later).
 func Query(ctx context.Context, ifaceName string, window time.Duration, onObs func(devicestore.Observation)) error {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return fmt.Errorf("resolve interface %q: %w", ifaceName, err)
+	}
 	addr, err := net.ResolveUDPAddr("udp4", ssdpAddr)
 	if err != nil {
 		return err
@@ -1714,6 +1771,15 @@ func Query(ctx context.Context, ifaceName string, window time.Duration, onObs fu
 		return fmt.Errorf("listen: %w", err)
 	}
 	defer conn.Close()
+
+	// Pin outbound multicast to the operator's iface so the M-SEARCH lands
+	// on the right segment. golang.org/x/net/ipv4 ships in the same module
+	// already required by mdns, so no new dependency.
+	pc := ipv4.NewPacketConn(conn)
+	if err := pc.SetMulticastInterface(iface); err != nil {
+		return fmt.Errorf("multicast iface: %w", err)
+	}
+
 	if _, err := conn.WriteTo([]byte(mSearchTemplate), addr); err != nil {
 		return err
 	}
@@ -1745,6 +1811,7 @@ func parseSSDPResponse(b []byte, ip net.IP) (devicestore.Observation, bool) {
 	if err != nil {
 		return devicestore.Observation{}, false
 	}
+	defer resp.Body.Close()
 	server := strings.TrimSpace(resp.Header.Get("SERVER"))
 	if server == "" {
 		return devicestore.Observation{}, false
@@ -1925,6 +1992,7 @@ package arpengine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -1962,6 +2030,7 @@ type runner struct {
 	target  Target
 	cancel  context.CancelFunc
 	started time.Time
+	done    chan struct{} // closed when loop exits and pcap handle is freed
 }
 
 // New returns an engine bound to a specific interface and operator MAC.
@@ -1974,26 +2043,45 @@ func New(iface string, opMAC net.HardwareAddr, cadence time.Duration) *Engine {
 }
 
 // Start begins poisoning t. Idempotent: starting an already-active target
-// is a no-op (returns nil without restarting).
+// is a no-op (returns nil without restarting). Releases e.mu around
+// pcap.OpenLive so a slow iface doesn't serialise every other engine op.
 func (e *Engine) Start(t Target) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	key := t.MAC.String()
+	e.mu.Lock()
 	if _, exists := e.active[key]; exists {
+		e.mu.Unlock()
 		return nil
 	}
+	e.mu.Unlock()
+
 	handle, err := pcap.OpenLive(e.iface, 65536, false, pcap.BlockForever)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", e.iface, err)
 	}
+
+	e.mu.Lock()
+	if _, exists := e.active[key]; exists {
+		// Lost the race — another caller installed a runner first. Close
+		// our orphan handle and return success.
+		e.mu.Unlock()
+		handle.Close()
+		return nil
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	r := &runner{target: t, cancel: cancel, started: time.Now()}
+	r := &runner{target: t, cancel: cancel, started: time.Now(), done: make(chan struct{})}
 	e.active[key] = r
-	go e.loop(ctx, handle, t)
+	e.mu.Unlock()
+
+	go e.loop(ctx, handle, t, r.done)
 	return nil
 }
 
-func (e *Engine) loop(ctx context.Context, handle *pcap.Handle, t Target) {
+func (e *Engine) loop(ctx context.Context, handle *pcap.Handle, t Target, done chan struct{}) {
+	// LIFO defers: close(done) runs LAST, after handle.Close. Stop unblocks
+	// only once the pcap handle is released, eliminating the race where the
+	// goroutine's final WritePacketData lands on the wire after Stop's
+	// corrective ARPs.
+	defer close(done)
 	defer handle.Close()
 	tick := time.NewTicker(e.cadence)
 	defer tick.Stop()
@@ -2019,8 +2107,9 @@ func (e *Engine) loop(ctx context.Context, handle *pcap.Handle, t Target) {
 }
 
 // Stop halts poisoning of the named target and emits corrective ARPs
-// asserting the real (gw,target) mappings. Blocks for up to 3*cadence to
-// give caches time to recover. No-op for unknown targets.
+// asserting the real (gw,target) mappings. Blocks until the poison
+// goroutine exits AND the corrective sequence completes — total wait is
+// approximately 3*cadence (default 3 s). No-op for unknown targets.
 func (e *Engine) Stop(t Target) error {
 	e.mu.Lock()
 	r, ok := e.active[t.MAC.String()]
@@ -2031,6 +2120,7 @@ func (e *Engine) Stop(t Target) error {
 	delete(e.active, t.MAC.String())
 	e.mu.Unlock()
 	r.cancel()
+	<-r.done // wait for the loop's deferred handle.Close → close(done) chain
 
 	handle, err := pcap.OpenLive(e.iface, 65536, false, pcap.BlockForever)
 	if err != nil {
@@ -2051,7 +2141,8 @@ func (e *Engine) Stop(t Target) error {
 	return nil
 }
 
-// StopAll halts every active poison. Errors are aggregated.
+// StopAll halts every active poison. Per-target errors from Stop are
+// aggregated via errors.Join.
 func (e *Engine) StopAll() error {
 	e.mu.Lock()
 	targets := make([]Target, 0, len(e.active))
@@ -2059,21 +2150,35 @@ func (e *Engine) StopAll() error {
 		targets = append(targets, r.target)
 	}
 	e.mu.Unlock()
+	var errs []error
 	for _, t := range targets {
-		_ = e.Stop(t)
+		if err := e.Stop(t); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
-// Active returns a snapshot of in-flight poisons.
+// Active returns a snapshot of in-flight poisons. Target slice fields
+// (MAC, IP, GwMAC, GwIP) are deep-copied so callers can't corrupt the
+// engine's internal state by mutating returned bytes.
 func (e *Engine) Active() []ActivePoison {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := make([]ActivePoison, 0, len(e.active))
 	for _, r := range e.active {
-		out = append(out, ActivePoison{Target: r.target, Started: r.started})
+		out = append(out, ActivePoison{Target: copyTarget(r.target), Started: r.started})
 	}
 	return out
+}
+
+func copyTarget(t Target) Target {
+	return Target{
+		MAC:   append(net.HardwareAddr{}, t.MAC...),
+		IP:    append(net.IP{}, t.IP...),
+		GwMAC: append(net.HardwareAddr{}, t.GwMAC...),
+		GwIP:  append(net.IP{}, t.GwIP...),
+	}
 }
 ```
 
@@ -2367,8 +2472,8 @@ func (m *Manager) RemoveTarget(ctx context.Context, mac net.HardwareAddr) error 
 	for _, t := range tables {
 		out, err := m.r.Run(ctx, t.listArgs)
 		if err != nil {
-			if bytes.Contains(out, []byte("No such file")) {
-				continue // table not created yet — fine
+			if nftMissing(out) {
+				continue // table not created yet — idempotent success
 			}
 			record(fmt.Errorf("list %s/%s: %w", t.family, t.table, err))
 			continue
@@ -2425,18 +2530,21 @@ trailers.)
 func parseRuleHandlesForMAC(out []byte, mac net.HardwareAddr) []string {
 	// nft -a output line examples:
 	//   ether saddr aa:bb:cc:dd:ee:01 drop comment "shardflow:aa:bb:cc:dd:ee:01" # handle 7
-	tag := "shardflow:" + mac.String()
+	// Match the exact nft-printed comment form including double-quotes so
+	// user comments containing the substring don't false-match.
+	tag := `"shardflow:` + mac.String() + `"`
 	var handles []string
 	for _, line := range bytes.Split(out, []byte("\n")) {
 		s := string(line)
-		if !contains(s, tag) || !contains(s, "# handle ") {
+		if !strings.Contains(s, tag) || !strings.Contains(s, "# handle ") {
 			continue
 		}
-		idx := indexOf(s, "# handle ")
-		if idx < 0 {
+		idx := strings.Index(s, "# handle ")
+		fs := strings.Fields(s[idx+len("# handle "):])
+		if len(fs) == 0 {
 			continue
 		}
-		handles = append(handles, fields(s[idx+len("# handle "):])[0])
+		handles = append(handles, fs[0])
 	}
 	return handles
 }
@@ -2765,27 +2873,39 @@ func classIDFor(mark uint32) string {
 }
 
 // EnsureIFB creates shardflow0 (idempotent), sets it up, attaches root HTB.
+// Each step propagates non-idempotent errors; "already exists" outputs are
+// tolerated as success.
 func (m *Manager) EnsureIFB(ctx context.Context) error {
-	_, _ = m.r.Run(ctx, "ip", argvAddIFB(IFBName))
-	if _, err := m.r.Run(ctx, "ip", argvSetUp(IFBName)); err != nil {
-		return err
+	if out, err := m.r.Run(ctx, "ip", argvAddIFB(IFBName)); err != nil && !isExisting(out) {
+		return fmt.Errorf("add ifb: %w", err)
 	}
-	_, _ = m.r.Run(ctx, "tc", argvAddRootHTB(IFBName))
+	if _, err := m.r.Run(ctx, "ip", argvSetUp(IFBName)); err != nil {
+		return fmt.Errorf("set up ifb: %w", err)
+	}
+	if out, err := m.r.Run(ctx, "tc", argvAddRootHTB(IFBName)); err != nil && !isExisting(out) {
+		return fmt.Errorf("add root htb: %w", err)
+	}
 	return nil
 }
 
 // EnsureCaptureIface creates shardflow-cap (dummy) and brings it up. The
 // pcapwriter reads frames mirrored here.
 func (m *Manager) EnsureCaptureIface(ctx context.Context) error {
-	_, _ = m.r.Run(ctx, "ip", argvAddDummy(CaptureName))
-	_, err := m.r.Run(ctx, "ip", argvSetUp(CaptureName))
-	return err
+	if out, err := m.r.Run(ctx, "ip", argvAddDummy(CaptureName)); err != nil && !isExisting(out) {
+		return fmt.Errorf("add dummy: %w", err)
+	}
+	if _, err := m.r.Run(ctx, "ip", argvSetUp(CaptureName)); err != nil {
+		return fmt.Errorf("set up dummy: %w", err)
+	}
+	return nil
 }
 
 // EnsureRedirect installs an ingress qdisc on the operator's real iface so
 // later filters have somewhere to attach. Idempotent.
 func (m *Manager) EnsureRedirect(ctx context.Context, realIface string) error {
-	_, _ = m.r.Run(ctx, "tc", argvAddIngressQdisc(realIface))
+	if out, err := m.r.Run(ctx, "tc", argvAddIngressQdisc(realIface)); err != nil && !isExisting(out) {
+		return fmt.Errorf("add ingress qdisc on %s: %w", realIface, err)
+	}
 	return nil
 }
 
@@ -2874,9 +2994,19 @@ func (m *Manager) Teardown(ctx context.Context) error {
 // isMissing returns true when iproute2/tc/ip output indicates the object
 // being deleted didn't exist — treated as success (idempotent cleanup).
 func isMissing(out []byte) bool {
-	s := string(out)
 	for _, marker := range []string{"Cannot find", "does not exist", "No such file", "RTNETLINK answers: No such"} {
-		if bytes.Contains([]byte(s), []byte(marker)) {
+		if bytes.Contains(out, []byte(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
+// isExisting returns true when iproute2/tc/ip output indicates the object
+// being added already exists — treated as success (idempotent setup).
+func isExisting(out []byte) bool {
+	for _, marker := range []string{"File exists", "already exists", "Exclusivity flag"} {
+		if bytes.Contains(out, []byte(marker)) {
 			return true
 		}
 	}
@@ -3072,8 +3202,21 @@ func (m *Manager) Open(mac, ipStr, srcIface, dir string, maxBytes int64, maxAge 
 	if maxAge == 0 {
 		maxAge = DefaultMaxAge
 	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &writer{mac: mac, dir: dir, cancel: cancel, finished: make(chan struct{})}
+
+	// Stake the map slot under the mutex BEFORE spawning the goroutine, so
+	// a duplicate Open for the same MAC is rejected without leaking a
+	// goroutine, pcap handle, or open file.
+	m.mu.Lock()
+	if _, exists := m.writers[mac]; exists {
+		m.mu.Unlock()
+		cancel()
+		return fmt.Errorf("pcapwriter: already capturing %s", mac)
+	}
+	m.writers[mac] = w
+	m.mu.Unlock()
 
 	startup := make(chan error, 1)
 	go func() {
@@ -3081,13 +3224,14 @@ func (m *Manager) Open(mac, ipStr, srcIface, dir string, maxBytes int64, maxAge 
 		_ = runWriter(ctx, mac, ipStr, srcIface, dir, maxBytes, maxAge, startup)
 	}()
 	if err := <-startup; err != nil {
+		// Roll back the staked slot.
+		m.mu.Lock()
+		delete(m.writers, mac)
+		m.mu.Unlock()
 		cancel()
 		<-w.finished
 		return err
 	}
-	m.mu.Lock()
-	m.writers[mac] = w
-	m.mu.Unlock()
 	return nil
 }
 
@@ -3181,8 +3325,13 @@ func runWriter(ctx context.Context, mac, ipStr, srcIface, dir string, maxBytes i
 				written = 0
 			}
 			if err := w.WritePacket(pkt.Metadata().CaptureInfo, data); err != nil {
+				_ = w.Flush()
 				return err
 			}
+			// `written` tracks payload bytes only; pcap-ng framing adds
+			// ~28 bytes per packet plus fixed headers, so the on-disk file
+			// may exceed maxBytes by a small margin. v1 treats maxBytes as
+			// advisory.
 			written += int64(len(data))
 		}
 	}
@@ -3424,10 +3573,14 @@ In `internal/policycompiler/compiler.go`:
 package policycompiler
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 	"sync"
+
+	"github.com/hett-patell/ShardFlow/internal/arpengine"
 )
 
 // Compiler orchestrates the four effectors.
@@ -3438,8 +3591,10 @@ type Compiler struct {
 	arp       ARP
 	realIface string
 
-	mu       sync.Mutex
-	current  map[string]Spec  // key: MAC.String()
+	// RWMutex per spec §7.5: writes (Apply) serialise; reads (Snapshot)
+	// run concurrently.
+	mu       sync.RWMutex
+	current  map[string]Spec   // key: MAC.String()
 	markOf   map[string]uint32 // key: MAC.String() — deterministic per-target fwmark
 	nextMark uint32
 }
@@ -3515,6 +3670,12 @@ func (c *Compiler) Apply(ctx context.Context, desired map[string]Spec) error {
 				continue // can't safely build over partial old state
 			}
 			delete(c.current, mac)
+		}
+		// Guard: if the mac is still present (phase 1 teardown failed for a
+		// kind change), don't try to layer the new policy on top of stale
+		// kernel state. Caller will retry on next Apply.
+		if _, stillStale := c.current[mac]; stillStale {
+			continue
 		}
 		if err := c.bringUpOne(ctx, want); err != nil {
 			record(err)
@@ -3644,7 +3805,7 @@ func specsEqual(a, b Spec) bool {
 	if !a.Target.IP.Equal(b.Target.IP) {
 		return false
 	}
-	if !bytesEq(a.Target.GwMAC, b.Target.GwMAC) {
+	if !bytes.Equal(a.Target.GwMAC, b.Target.GwMAC) {
 		return false
 	}
 	if !a.Target.GwIP.Equal(b.Target.GwIP) {
@@ -3653,27 +3814,27 @@ func specsEqual(a, b Spec) bool {
 	return true
 }
 
-func bytesEq(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// Snapshot returns a copy of the current desired state.
+// Snapshot returns a deep copy of the current desired state. Target slice
+// fields are copied so callers can't corrupt internal state by mutating
+// the returned bytes.
 func (c *Compiler) Snapshot() map[string]Spec {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	out := make(map[string]Spec, len(c.current))
 	for k, v := range c.current {
+		v.Target = copyTarget(v.Target)
 		out[k] = v
 	}
 	return out
+}
+
+func copyTarget(t arpengine.Target) arpengine.Target {
+	return arpengine.Target{
+		MAC:   append(net.HardwareAddr{}, t.MAC...),
+		IP:    append(net.IP{}, t.IP...),
+		GwMAC: append(net.HardwareAddr{}, t.GwMAC...),
+		GwIP:  append(net.IP{}, t.GwIP...),
+	}
 }
 ```
 
@@ -3991,6 +4152,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/hett-patell/ShardFlow/internal/arpengine"
@@ -4023,10 +4185,19 @@ type HandlerDeps struct {
 	// DefaultPcapDir is applied when Policy.Set's pcap_dir is empty. If
 	// also empty the handler rejects the request with InvalidParams.
 	DefaultPcapDir string
+
+	// applyMu serialises the snapshot→modify→Apply sequence in setPolicy
+	// and clearPolicy so concurrent handler invocations can't clobber
+	// each other with stale snapshots. Compiler.Apply has its own mutex
+	// but that only makes each Apply atomic — it doesn't cover the
+	// handler-level RMW. HandlerDeps must therefore be passed by pointer
+	// to BuildHandlers so closures share the same lock.
+	applyMu sync.Mutex
 }
 
-// BuildHandlers returns the method table from a HandlerDeps.
-func BuildHandlers(d HandlerDeps) map[string]Handler {
+// BuildHandlers returns the method table from a HandlerDeps. Pointer
+// receiver so closures share applyMu across the seven handlers.
+func BuildHandlers(d *HandlerDeps) map[string]Handler {
 	return map[string]Handler{
 		MethodScan: func(ctx context.Context, _ json.RawMessage) (any, *Error) {
 			if err := d.Scanner(ctx); err != nil {
@@ -4094,7 +4265,7 @@ func BuildHandlers(d HandlerDeps) map[string]Handler {
 	}
 }
 
-func setPolicy(ctx context.Context, d HandlerDeps, p PolicySpec) (any, *Error) {
+func setPolicy(ctx context.Context, d *HandlerDeps, p PolicySpec) (any, *Error) {
 	mac, ferr := resolveTarget(d.Store, p.Target)
 	if ferr != nil {
 		return nil, ferr
@@ -4124,9 +4295,12 @@ func setPolicy(ctx context.Context, d HandlerDeps, p PolicySpec) (any, *Error) {
 			spec.PcapDir = p.PcapDir
 		}
 	}
+	d.applyMu.Lock()
 	desired := d.Compiler.Snapshot()
 	desired[mac.String()] = spec
-	if err := d.Compiler.Apply(ctx, desired); err != nil {
+	err := d.Compiler.Apply(ctx, desired)
+	d.applyMu.Unlock()
+	if err != nil {
 		return nil, &Error{Code: CodeInternalError, Message: err.Error()}
 	}
 	if d.Broadcaster != nil {
@@ -4138,14 +4312,17 @@ func setPolicy(ctx context.Context, d HandlerDeps, p PolicySpec) (any, *Error) {
 	return map[string]string{"status": "applied"}, nil
 }
 
-func clearPolicy(ctx context.Context, d HandlerDeps, target string) (any, *Error) {
+func clearPolicy(ctx context.Context, d *HandlerDeps, target string) (any, *Error) {
 	mac, ferr := resolveTarget(d.Store, target)
 	if ferr != nil {
 		return nil, ferr
 	}
+	d.applyMu.Lock()
 	desired := d.Compiler.Snapshot()
 	delete(desired, mac.String())
-	if err := d.Compiler.Apply(ctx, desired); err != nil {
+	err := d.Compiler.Apply(ctx, desired)
+	d.applyMu.Unlock()
+	if err != nil {
 		return nil, &Error{Code: CodeInternalError, Message: err.Error()}
 	}
 	if d.Broadcaster != nil {
@@ -4339,10 +4516,6 @@ func run() (err error) {
 	shutdown := func() {
 		shutdownOnce.Do(func() {
 			_ = arp.StopAll()
-			// Apply empty desired-state: tears down every target, removing
-			// per-mark redirect/mirror filters from the real iface ingress.
-			// Without this, shardflow0 / shardflow-cap could be removed
-			// while filters still reference them by name.
 			_ = comp.Apply(context.Background(), map[string]policycompiler.Spec{})
 			_ = nft.Teardown(context.Background())
 			_ = pc.CloseAll()
@@ -4353,6 +4526,25 @@ func run() (err error) {
 		if err != nil {
 			shutdown()
 		}
+	}()
+
+	// Forward-declare srv so the signal handler closure can reference it
+	// even before rpc.NewServer is called.
+	var srv *rpc.Server
+
+	// Install the signal handler BEFORE any kernel-mutating EnsureX call
+	// so a SIGINT/SIGTERM during startup runs the same shutdown path
+	// instead of orphaning newly-created kernel state.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		fmt.Fprintln(os.Stderr, "shardflowd: shutting down")
+		if srv != nil {
+			_ = srv.Stop()
+		}
+		shutdown()
+		cancel()
 	}()
 
 	if err := nft.EnsureTables(ctx, info.Name); err != nil {
@@ -4395,10 +4587,7 @@ func run() (err error) {
 		return nil
 	}
 
-	// Forward declaration so the broadcaster closure can refer to srv
-	// before it is constructed (Go closures capture by reference).
-	var srv *rpc.Server
-	handlers := rpc.BuildHandlers(rpc.HandlerDeps{
+	handlers := rpc.BuildHandlers(&rpc.HandlerDeps{
 		Store:    store,
 		Compiler: comp,
 		Scanner:  scanner,
@@ -4414,24 +4603,33 @@ func run() (err error) {
 	})
 	srv = rpc.NewServer(handlers)
 
-	// Bridge devicestore subscription → server broadcast. Convert to the
-	// DTO wire form so clients (TUI, CLI --json) get string-form IPs/MACs
-	// rather than base64 byte arrays.
+	// Bridge devicestore subscription → server broadcast. Selects on
+	// ctx.Done() so the goroutine exits cleanly on shutdown; defers
+	// Unsubscribe so the store doesn't keep a dead subscriber slot.
 	go func() {
 		ch := store.Subscribe()
-		for ev := range ch {
-			method := rpc.EventDeviceUpdated
-			if ev.Kind == devicestore.EventDiscovered {
-				method = rpc.EventDeviceDiscovered
+		defer store.Unsubscribe(ch)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev, ok := <-ch:
+				if !ok {
+					return
+				}
+				method := rpc.EventDeviceUpdated
+				if ev.Kind == devicestore.EventDiscovered {
+					method = rpc.EventDeviceDiscovered
+				}
+				dto := rpc.DeviceDTO{
+					MAC:      ev.Device.MAC.String(),
+					IP:       ev.Device.IP.String(),
+					Hostname: ev.Device.Hostname,
+					Vendor:   ev.Device.Vendor,
+					LastSeen: ev.Device.LastSeen.Format(time.RFC3339),
+				}
+				srv.Broadcast(method, dto)
 			}
-			dto := rpc.DeviceDTO{
-				MAC:      ev.Device.MAC.String(),
-				IP:       ev.Device.IP.String(),
-				Hostname: ev.Device.Hostname,
-				Vendor:   ev.Device.Vendor,
-				LastSeen: ev.Device.LastSeen.Format(time.RFC3339),
-			}
-			srv.Broadcast(method, dto)
 		}
 	}()
 
@@ -4449,16 +4647,8 @@ func run() (err error) {
 		}
 	}()
 
-	// Signal handling: invoke shutdown (idempotent) and exit.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sig
-		fmt.Fprintln(os.Stderr, "shardflowd: shutting down")
-		_ = srv.Stop()
-		shutdown()
-		cancel()
-	}()
+	// (Signal handling is registered earlier, before kernel-mutating
+	// EnsureX calls — see above.)
 
 	if err := srv.Listen(ctx, *sockFlag); err != nil {
 		return err
@@ -4780,7 +4970,8 @@ func Dial(sockPath string) (*Client, error) {
 	return c, nil
 }
 
-// Events returns a channel of server-pushed events. Closed when Close is called.
+// Events returns a channel of server-pushed events. The channel is closed
+// when the underlying connection is lost (including when Close is called).
 func (c *Client) Events() <-chan Event { return c.events }
 
 // Close terminates the connection.
@@ -4799,6 +4990,12 @@ func (c *Client) Close() error {
 // decodes the response into out (pointer or nil).
 func (c *Client) Call(ctx context.Context, method string, params any, out any) error {
 	c.mu.Lock()
+	// Guard against post-disconnect calls: readLoop sets pending=nil on
+	// connection error; writing to a nil map would panic.
+	if c.pending == nil {
+		c.mu.Unlock()
+		return errors.New("rpc: connection closed")
+	}
 	c.nextID++
 	id := c.nextID
 	ch := make(chan *Response, 1)
@@ -5235,21 +5432,29 @@ func policyListCmd() *cobra.Command {
 	}
 }
 
-// parseRate accepts "200kbit", "1mbit", "500kbps" → kbit
+// parseRate accepts "200kbit", "1mbit", "500kbps", "2mbps" → kbit.
+// kbit/kbps and mbit/mbps follow networking SI convention (1 mbit = 1000 kbit).
+// A unit suffix is required; bare numbers and zero/negative rates are rejected.
 func parseRate(s string) (int, error) {
 	s = strings.ToLower(strings.TrimSpace(s))
-	mul := 1
+	mul := 0
 	num := s
 	switch {
 	case strings.HasSuffix(s, "kbit"), strings.HasSuffix(s, "kbps"):
 		num = s[:len(s)-4]
+		mul = 1
 	case strings.HasSuffix(s, "mbit"), strings.HasSuffix(s, "mbps"):
 		num = s[:len(s)-4]
-		mul = 1024
+		mul = 1000 // SI: 1 mbit = 1000 kbit
+	default:
+		return 0, fmt.Errorf("bad rate %q: expected suffix kbit, mbit, kbps, or mbps", s)
 	}
 	n, err := strconv.Atoi(num)
 	if err != nil {
-		return 0, fmt.Errorf("bad rate %q", s)
+		return 0, fmt.Errorf("bad rate %q: %w", s, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("bad rate %q: must be a positive integer", s)
 	}
 	return n * mul, nil
 }
