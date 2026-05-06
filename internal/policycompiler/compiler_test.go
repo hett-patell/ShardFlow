@@ -142,3 +142,29 @@ func containsPrefix(haystack []string, prefix string) bool {
 	}
 	return false
 }
+
+func TestSnapshotDeepCopiesTargetSlices(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:04")
+	nft, tc, pc, arp := &fakeNFT{}, &fakeTC{}, &fakePcap{}, &fakeARP{}
+	c := New(nft, tc, pc, arp, "eth0")
+
+	require.NoError(t, c.Apply(context.Background(), map[string]Spec{
+		mac.String(): {Target: arpengine.Target{
+			MAC:   mac,
+			IP:    net.ParseIP("10.0.0.42").To4(),
+			GwMAC: net.HardwareAddr{0x11, 0x22, 0x33, 0x44, 0x55, 0x66},
+			GwIP:  net.ParseIP("10.0.0.1").To4(),
+		}, Kind: KindDrop},
+	}))
+
+	snap := c.Snapshot()
+	got := snap[mac.String()]
+	// Mutate the returned slice fields and verify the compiler's internal
+	// state is unaffected.
+	got.Target.IP[0] = 0xff
+	got.Target.GwMAC[0] = 0xff
+
+	again := c.Snapshot()[mac.String()]
+	assert.Equal(t, "10.0.0.42", again.Target.IP.String(), "Snapshot must deep-copy Target.IP")
+	assert.Equal(t, "11:22:33:44:55:66", again.Target.GwMAC.String(), "Snapshot must deep-copy Target.GwMAC")
+}

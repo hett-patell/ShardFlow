@@ -1,10 +1,14 @@
 package policycompiler
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 	"sync"
+
+	"github.com/hett-patell/ShardFlow/internal/arpengine"
 )
 
 // Compiler orchestrates the four effectors.
@@ -15,7 +19,7 @@ type Compiler struct {
 	arp       ARP
 	realIface string
 
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	current  map[string]Spec   // key: MAC.String()
 	markOf   map[string]uint32 // key: MAC.String() — deterministic per-target fwmark
 	nextMark uint32
@@ -92,6 +96,12 @@ func (c *Compiler) Apply(ctx context.Context, desired map[string]Spec) error {
 				continue
 			}
 			delete(c.current, mac)
+		}
+		// Guard: if the mac is still present (phase 1 teardown failed for a
+		// kind change), don't try to layer the new policy on top of stale
+		// state. Caller will retry on next Apply.
+		if _, stillStale := c.current[mac]; stillStale {
+			continue
 		}
 		if err := c.bringUpOne(ctx, want); err != nil {
 			record(err)
@@ -205,7 +215,7 @@ func specsEqual(a, b Spec) bool {
 	if !a.Target.IP.Equal(b.Target.IP) {
 		return false
 	}
-	if !bytesEq(a.Target.GwMAC, b.Target.GwMAC) {
+	if !bytes.Equal(a.Target.GwMAC, b.Target.GwMAC) {
 		return false
 	}
 	if !a.Target.GwIP.Equal(b.Target.GwIP) {
@@ -214,24 +224,26 @@ func specsEqual(a, b Spec) bool {
 	return true
 }
 
-func bytesEq(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
+// copyTarget returns a deep copy of t so callers can't mutate the
+// compiler's internal state through the returned slice headers.
+func copyTarget(t arpengine.Target) arpengine.Target {
+	return arpengine.Target{
+		MAC:   append(net.HardwareAddr{}, t.MAC...),
+		IP:    append(net.IP{}, t.IP...),
+		GwMAC: append(net.HardwareAddr{}, t.GwMAC...),
+		GwIP:  append(net.IP{}, t.GwIP...),
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
-// Snapshot returns a copy of the current desired state.
+// Snapshot returns a copy of the current desired state. Target slice
+// fields are deep-copied so callers can mutate the result without
+// corrupting the compiler's internal state.
 func (c *Compiler) Snapshot() map[string]Spec {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	out := make(map[string]Spec, len(c.current))
 	for k, v := range c.current {
+		v.Target = copyTarget(v.Target)
 		out[k] = v
 	}
 	return out
