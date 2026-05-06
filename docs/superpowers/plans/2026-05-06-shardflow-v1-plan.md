@@ -812,9 +812,11 @@ type Info struct {
 	Gateway net.IP     // best-effort IPv4 default gateway; nil if unknown
 }
 
-// Lookup returns Info for the named interface. The Gateway field is
-// populated by parsing `ip route show default`; if that fails, Gateway is nil
-// and the caller is expected to handle it.
+// Lookup returns Info for the named interface. On success, IP and IPNet
+// are always non-nil — Lookup returns an error if the interface has no
+// IPv4 address. The Gateway field is populated by parsing `ip route show
+// default`; if that fails, Gateway is nil and the caller is expected to
+// handle it (Gateway is best-effort, IP/IPNet are required).
 func Lookup(name string) (Info, error) {
 	netIf, err := net.InterfaceByName(name)
 	if err != nil {
@@ -827,12 +829,19 @@ func Lookup(name string) (Info, error) {
 	info := Info{Name: name, Index: netIf.Index, HwAddr: netIf.HardwareAddr}
 	for _, a := range addrs {
 		ipnet, ok := a.(*net.IPNet)
-		if !ok || ipnet.IP.To4() == nil {
+		if !ok {
 			continue
 		}
-		info.IP = ipnet.IP.To4()
-		info.IPNet = &net.IPNet{IP: info.IP, Mask: ipnet.Mask}
+		ip4 := ipnet.IP.To4()
+		if ip4 == nil {
+			continue
+		}
+		info.IP = ip4
+		info.IPNet = &net.IPNet{IP: ip4, Mask: ipnet.Mask}
 		break
+	}
+	if info.IP == nil {
+		return Info{}, fmt.Errorf("iface %s: no IPv4 address", name)
 	}
 	info.Gateway = defaultGateway(name)
 	return info, nil
