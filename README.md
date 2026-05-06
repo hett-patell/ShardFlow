@@ -27,7 +27,7 @@ Bluetooth speaker hits 100 dB at 3 AM.
 | **Throttle** | Rate-limit a victim to a specific bitrate. Want your housemate's 4K stream to load like 2007? `200kbit` does the trick. |
 | **Pcap** | Passively capture a target's traffic to a rotating `.pcapng`. Read it later in Wireshark and pretend you understand it. |
 | **TUI dashboard** | Bubbletea-powered hacker green/cyan/pink terminal UI. One screen for everything. Scan, pick, attack, watch, regret. |
-| **Aggressive ARP poisoning** | 200 ms cadence × 6 frames/cycle = 30 frames/sec/target across REQUEST, REPLY, and gratuitous (broadcast) forms — fast enough to keep modern Android/iOS phones' caches stuck on the operator's MAC. Plus a parallel race-respond listener that emits poisoned replies the instant it sees a victim ARP-probe the gateway, beating the real gateway to the punch. |
+| **Tunable ARP poisoning** | 1 Hz cadence × 4 frames/cycle by default — reliable across set/clear cycles. For stubborn modern phones whose kernels auto-refresh faster than 1 Hz, crank `-poison-cadence 200ms` (~20 fps/target) or `50ms` (~80 fps) — at the cost of a slower `policy clear` because the corrective has to flood harder to win the cache back. The corrective on clear sends 90+ ARP frames across REQUEST, REPLY, and gratuitous forms over ~3 s to dislodge whatever the poison left behind. |
 
 Implementation is the hybrid kernel-fast-path approach: **nftables** for drops,
 **tc + IFB** for throttle, **libpcap** for capture, **AF_PACKET ARP poisoning**

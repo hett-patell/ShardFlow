@@ -42,8 +42,8 @@ func run() (err error) {
 		forceFlag      = flag.Bool("force", false, "remove stale socket if present")
 		cleanFlag      = flag.Bool("clean-on-start", false, "clean orphaned kernel state from a prior run")
 		defaultPcapDir = flag.String("default-pcap-dir", "/var/lib/shardflow/pcap", "directory used by Policy.Set pcap when its pcap_dir is empty")
-		poisonCadence  = flag.Duration("poison-cadence", 200*time.Millisecond,
-			"interval between ARP poison bursts per target. Lower = more aggressive (wins races against modern phones); higher = less network noise. Each burst sends 6 frames per active target.")
+		poisonCadence = flag.Duration("poison-cadence", time.Second,
+			"interval between ARP poison bursts per target. Default 1s is reliable for `policy clear` correctives. For stubborn modern phones (iOS 16+, hardened Android) where 1Hz loses the race, dial down to 200ms (≈20 fps) or 50ms (≈80 fps). Each burst sends 4 frames per target.")
 	)
 	flag.Parse()
 	if *ifaceFlag == "" {
