@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/ipv4"
+
 	"github.com/hett-patell/ShardFlow/internal/devicestore"
 )
 
@@ -22,10 +24,14 @@ const mSearchTemplate = "M-SEARCH * HTTP/1.1\r\n" +
 	"MX: 2\r\n" +
 	"ST: ssdp:all\r\n\r\n"
 
-// Query sends one M-SEARCH and listens for window. Each response with a
-// usable SERVER header produces an observation keyed by the source IP
-// (caller resolves IP→MAC via devicestore later).
+// Query sends one M-SEARCH on the named interface and listens for window.
+// Each response with a usable SERVER header produces an observation keyed
+// by the source IP (caller resolves IP→MAC via devicestore later).
 func Query(ctx context.Context, ifaceName string, window time.Duration, onObs func(devicestore.Observation)) error {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return fmt.Errorf("resolve interface %q: %w", ifaceName, err)
+	}
 	addr, err := net.ResolveUDPAddr("udp4", ssdpAddr)
 	if err != nil {
 		return err
@@ -35,6 +41,14 @@ func Query(ctx context.Context, ifaceName string, window time.Duration, onObs fu
 		return fmt.Errorf("listen: %w", err)
 	}
 	defer conn.Close()
+
+	// Pin outbound multicast to the operator's iface so the M-SEARCH lands
+	// on the right segment, regardless of the kernel routing table's choice.
+	pc := ipv4.NewPacketConn(conn)
+	if err := pc.SetMulticastInterface(iface); err != nil {
+		return fmt.Errorf("multicast iface: %w", err)
+	}
+
 	if _, err := conn.WriteTo([]byte(mSearchTemplate), addr); err != nil {
 		return err
 	}
@@ -66,6 +80,7 @@ func parseSSDPResponse(b []byte, ip net.IP) (devicestore.Observation, bool) {
 	if err != nil {
 		return devicestore.Observation{}, false
 	}
+	defer resp.Body.Close()
 	server := strings.TrimSpace(resp.Header.Get("SERVER"))
 	if server == "" {
 		return devicestore.Observation{}, false

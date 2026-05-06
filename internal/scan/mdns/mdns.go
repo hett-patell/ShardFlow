@@ -19,27 +19,33 @@ const (
 	queryFor = "_services._dns-sd._udp.local."
 )
 
-// Query sends a single mDNS-SD PTR query and listens for window. Each A
-// record observed in a response is passed to onObs.
+// Query sends a single mDNS-SD PTR query on the named interface and listens
+// for window. Each A record observed in a response is passed to onObs.
 //
 // Note: binds UDP/5353 explicitly — fails with EADDRINUSE on hosts running
 // avahi-daemon. Documented v1 limitation; Phase 7 integration tests run in
 // netns where avahi isn't present.
 func Query(ctx context.Context, ifaceName string, window time.Duration, onObs func(devicestore.Observation)) error {
-	addr, err := net.ResolveUDPAddr("udp4", mdnsAddr)
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return fmt.Errorf("resolve interface %q: %w", ifaceName, err)
+	}
+	groupAddr, err := net.ResolveUDPAddr("udp4", mdnsAddr)
 	if err != nil {
 		return err
 	}
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 5353})
+	// ListenMulticastUDP joins 224.0.0.251 on the named iface (IP_ADD_MEMBERSHIP)
+	// and sets IP_MULTICAST_IF, so responses from devices on that segment
+	// are delivered even when no other process holds the group membership.
+	conn, err := net.ListenMulticastUDP("udp4", iface, &net.UDPAddr{IP: net.ParseIP("224.0.0.251"), Port: 5353})
 	if err != nil {
-		return fmt.Errorf("listen: %w", err)
+		return fmt.Errorf("listen multicast: %w", err)
 	}
 	defer conn.Close()
-	if _, err := conn.WriteTo(buildQuery(queryFor), addr); err != nil {
+	if _, err := conn.WriteTo(buildQuery(queryFor), groupAddr); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(window)
-	if err := conn.SetReadDeadline(deadline); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(window)); err != nil {
 		return err
 	}
 	buf := make([]byte, 65536)
@@ -56,9 +62,7 @@ func Query(ctx context.Context, ifaceName string, window time.Duration, onObs fu
 			}
 			return err
 		}
-		if obs, ok := parseMDNS(buf[:n], src); ok {
-			onObs(obs)
-		}
+		parseMDNS(buf[:n], src, onObs)
 	}
 }
 
@@ -74,18 +78,20 @@ func buildQuery(name string) []byte {
 	return b
 }
 
-func parseMDNS(pkt []byte, src *net.UDPAddr) (devicestore.Observation, bool) {
+// parseMDNS extracts every A record in the response and calls onObs once
+// per record. Non-A answers are skipped.
+func parseMDNS(pkt []byte, src *net.UDPAddr, onObs func(devicestore.Observation)) {
 	var p dnsmessage.Parser
 	if _, err := p.Start(pkt); err != nil {
-		return devicestore.Observation{}, false
+		return
 	}
 	if err := p.SkipAllQuestions(); err != nil {
-		return devicestore.Observation{}, false
+		return
 	}
 	for {
 		h, err := p.AnswerHeader()
 		if err != nil {
-			break
+			return
 		}
 		switch h.Type {
 		case dnsmessage.TypeA:
@@ -93,19 +99,19 @@ func parseMDNS(pkt []byte, src *net.UDPAddr) (devicestore.Observation, bool) {
 			if err != nil {
 				continue
 			}
-			return devicestore.Observation{
+			// Copy r.A into a fresh slice — r.A lives on the stack-allocated
+			// parser; aliasing via r.A[:] would be unsafe across iterations.
+			onObs(devicestore.Observation{
 				Hostname: trimDot(h.Name.String()),
-				IP:       net.IP(r.A[:]),
+				IP:       net.IP{r.A[0], r.A[1], r.A[2], r.A[3]},
 				Seen:     time.Now(),
-			}, true
+			})
 		default:
 			if err := p.SkipAnswer(); err != nil {
-				return devicestore.Observation{}, false
+				return
 			}
 		}
 	}
-	_ = src
-	return devicestore.Observation{}, false
 }
 
 func trimDot(s string) string { return strings.TrimSuffix(s, ".") }
