@@ -65,3 +65,28 @@ func TestManagerEnsureTablesPipesAtomicScript(t *testing.T) {
 	assert.Contains(t, s, "add table netdev shardflow_ingress")
 	assert.Contains(t, s, "device eth0")
 }
+
+func TestParseRuleHandlesForMAC(t *testing.T) {
+	out := []byte(`table inet shardflow {
+	chain forward_chain {
+		ether saddr aa:bb:cc:dd:ee:01 drop comment "shardflow:aa:bb:cc:dd:ee:01" # handle 7
+		ether saddr aa:bb:cc:dd:ee:02 drop comment "shardflow:aa:bb:cc:dd:ee:02" # handle 8
+		ether saddr aa:bb:cc:dd:ee:03 drop comment "user-note about shardflow:aa:bb:cc:dd:ee:01 deployment" # handle 9
+	}
+}
+`)
+	mac1, _ := net.ParseMAC("aa:bb:cc:dd:ee:01")
+	mac2, _ := net.ParseMAC("aa:bb:cc:dd:ee:02")
+
+	// mac1 should match exactly one rule (handle 7) — NOT handle 9, whose
+	// comment merely mentions "shardflow:aa:bb:cc:dd:ee:01" inside other text.
+	got1 := parseRuleHandlesForMAC(out, mac1)
+	assert.Equal(t, []string{"7"}, got1)
+
+	got2 := parseRuleHandlesForMAC(out, mac2)
+	assert.Equal(t, []string{"8"}, got2)
+
+	// Unknown MAC returns no handles.
+	mac9, _ := net.ParseMAC("ff:ff:ff:ff:ff:ff")
+	assert.Empty(t, parseRuleHandlesForMAC(out, mac9))
+}

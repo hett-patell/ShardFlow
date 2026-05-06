@@ -60,6 +60,9 @@ func NewWithRunner(r Runner) *Manager { return &Manager{r: r} }
 // piped via `nft -f -`. Using stdin sidesteps any argv-quoting concerns
 // around the curly-brace chain definition bodies.
 func (m *Manager) EnsureTables(ctx context.Context, realIface string) error {
+	// realIface comes from iface.Lookup which calls net.InterfaceByName;
+	// IFNAMSIZ caps it at 15 bytes with no spaces or shell metacharacters,
+	// so direct interpolation is safe.
 	script := fmt.Sprintf(`
 add table inet %s
 add chain inet %s %s { type filter hook forward priority 0; policy accept; }
@@ -115,7 +118,7 @@ func (m *Manager) RemoveTarget(ctx context.Context, mac net.HardwareAddr) error 
 	for _, t := range tables {
 		out, err := m.r.Run(ctx, t.listArgs)
 		if err != nil {
-			if bytes.Contains(out, []byte("No such file")) {
+			if nftMissing(out) {
 				continue
 			}
 			record(fmt.Errorf("list %s/%s: %w", t.family, t.table, err))
@@ -156,9 +159,9 @@ func nftMissing(out []byte) bool {
 // tags and returns the handle ids of every matching rule. Both egress and
 // return-direction rules carry the same tag so a single MAC keys them all.
 func parseRuleHandlesForMAC(out []byte, mac net.HardwareAddr) []string {
-	// Example line:
-	//   ether saddr aa:bb:cc:dd:ee:01 drop comment "shardflow:aa:bb:cc:dd:ee:01" # handle 7
-	tag := "shardflow:" + mac.String()
+	// Match the exact nft-printed comment form, including double-quotes,
+	// so user comments containing the substring don't false-match.
+	tag := `"shardflow:` + mac.String() + `"`
 	var handles []string
 	for _, line := range bytes.Split(out, []byte("\n")) {
 		s := string(line)

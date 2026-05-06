@@ -19,19 +19,10 @@ func argvEnsureDropTable() []string {
 	return []string{"add", "table", dropTableFamily, dropTableName}
 }
 
-func argvEnsureDropChain() []string {
-	return []string{"add", "chain", dropTableFamily, dropTableName, dropChainName,
-		"{ type filter hook forward priority 0; policy accept; }"}
-}
-
 func argvAddDropRule(targetMAC net.HardwareAddr) []string {
 	return []string{"add", "rule", dropTableFamily, dropTableName, dropChainName,
 		"ether", "saddr", targetMAC.String(), "drop",
 		"comment", `"` + commentTagFor(targetMAC) + `"`}
-}
-
-func argvEnsureMarkTable() []string {
-	return []string{"add", "table", markTableFamily, markTableName}
 }
 
 // netdev ingress chain MUST be bound to a real iface; the iface name is
