@@ -3586,8 +3586,10 @@ type Compiler struct {
 	arp       ARP
 	realIface string
 
-	mu       sync.Mutex
-	current  map[string]Spec  // key: MAC.String()
+	// RWMutex per spec §7.5: writes (Apply) serialise; reads (Snapshot)
+	// run concurrently.
+	mu       sync.RWMutex
+	current  map[string]Spec   // key: MAC.String()
 	markOf   map[string]uint32 // key: MAC.String() — deterministic per-target fwmark
 	nextMark uint32
 }
