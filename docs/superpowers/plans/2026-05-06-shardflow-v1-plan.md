@@ -1179,6 +1179,10 @@ import (
 // Sweep sends ARP requests for every host in cidr from the operator's
 // (srcMAC, srcIP) on the given iface, listens for replies for window, and
 // invokes onObs for each reply.
+//
+// onObs is invoked from a dedicated listener goroutine; it must be safe
+// for concurrent use. Sweep returns only after the listener goroutine has
+// exited, so onObs is never called after Sweep returns.
 func Sweep(ctx context.Context, ifaceName string, srcMAC net.HardwareAddr, srcIP net.IP, cidr *net.IPNet, window time.Duration, onObs func(devicestore.Observation)) error {
 	handle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
 	if err != nil {
@@ -1189,10 +1193,16 @@ func Sweep(ctx context.Context, ifaceName string, srcMAC net.HardwareAddr, srcIP
 		return fmt.Errorf("bpf: %w", err)
 	}
 
-	// Listener goroutine.
 	listenCtx, cancelListen := context.WithCancel(ctx)
-	defer cancelListen()
 	var wg sync.WaitGroup
+	// Defers fire LIFO, so on return the order is cancelListen → wg.Wait
+	// → handle.Close. The listener goroutine exits when listenCtx is
+	// cancelled; wg.Wait then blocks until that exit completes; only then
+	// is the pcap handle closed. Covers every early-return path (BPF
+	// setup, send errors) as well as normal window-expiry.
+	defer wg.Wait()
+	defer cancelListen()
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1223,8 +1233,14 @@ func Sweep(ctx context.Context, ifaceName string, srcMAC net.HardwareAddr, srcIP
 		}
 	}()
 
-	// Sender: blast one request per host in the CIDR.
+	// Sender: blast one request per host in the CIDR. Respects ctx so a
+	// cancelled sweep doesn't keep flushing the entire CIDR.
 	for ip := nextIP(cidr.IP.Mask(cidr.Mask)); cidr.Contains(ip); ip = nextIP(ip) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		frame, err := buildARPRequest(srcMAC, srcIP, ip)
 		if err != nil {
 			return err
@@ -1235,12 +1251,12 @@ func Sweep(ctx context.Context, ifaceName string, srcMAC net.HardwareAddr, srcIP
 	}
 
 	// Wait for either window expiry or context cancellation.
+	timer := time.NewTimer(window)
+	defer timer.Stop()
 	select {
-	case <-time.After(window):
+	case <-timer.C:
 	case <-ctx.Done():
 	}
-	cancelListen()
-	wg.Wait()
 	return nil
 }
 
