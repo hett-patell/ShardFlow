@@ -42,6 +42,8 @@ func run() (err error) {
 		forceFlag      = flag.Bool("force", false, "remove stale socket if present")
 		cleanFlag      = flag.Bool("clean-on-start", false, "clean orphaned kernel state from a prior run")
 		defaultPcapDir = flag.String("default-pcap-dir", "/var/lib/shardflow/pcap", "directory used by Policy.Set pcap when its pcap_dir is empty")
+		poisonCadence  = flag.Duration("poison-cadence", 200*time.Millisecond,
+			"interval between ARP poison bursts per target. Lower = more aggressive (wins races against modern phones); higher = less network noise. Each burst sends 6 frames per active target.")
 	)
 	flag.Parse()
 	if *ifaceFlag == "" {
@@ -91,7 +93,9 @@ func run() (err error) {
 	nft := nftmgr.New()
 	tcm := tcmgr.New()
 	pc := pcapwriter.New()
-	arp := arpengine.New(info.Name, info.HwAddr, time.Second)
+	arp := arpengine.New(info.Name, info.HwAddr, *poisonCadence)
+	fmt.Fprintf(os.Stderr, "shardflowd: poison cadence = %s (≈ %.0f bursts/sec/target)\n",
+		*poisonCadence, float64(time.Second)/float64(*poisonCadence))
 	comp := policycompiler.New(nft, tcm, pc, arp, info.Name)
 
 	ctx, cancel := context.WithCancel(context.Background())

