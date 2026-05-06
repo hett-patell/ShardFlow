@@ -16,5 +16,19 @@
 # OS
 .DS_Store
 
-# Local plugin state
+# Local plugin / agent state
 .remember/
+.agents/
+.claude/
+.codex/
+
+# Stray top-level binaries built outside of /bin/
+/shardflow
+/shardflowd
+
+# Local diagnostic / scratch text files (GitHub traffic stats, etc.)
+/clones.txt
+/path.txt
+/refer.txt
+*.pcapng
+*.log
