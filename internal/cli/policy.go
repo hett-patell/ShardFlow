@@ -40,10 +40,10 @@ func policySetCmd() *cobra.Command {
 					return err
 				}
 			case rpc.PolicyPcap:
-				if len(args) < 3 {
-					return fmt.Errorf("pcap requires a directory")
+				if len(args) >= 3 {
+					p.PcapDir = args[2]
 				}
-				p.PcapDir = args[2]
+				// else leave PcapDir empty so the daemon applies its --default-pcap-dir
 			case rpc.PolicyDrop:
 				// no extra args
 			default:

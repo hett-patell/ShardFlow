@@ -50,6 +50,7 @@ func (s *Server) Listen(ctx context.Context, path string) error {
 	go func() {
 		<-ctx.Done()
 		_ = l.Close()
+		_ = os.Remove(path)
 	}()
 	for {
 		conn, err := l.Accept()
