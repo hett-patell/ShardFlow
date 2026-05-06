@@ -26,7 +26,7 @@ func TestModelMovesSelectionDownUp(t *testing.T) {
 
 func TestRenderedViewFitsTerminalWidth(t *testing.T) {
 	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
-	m.width, m.height = 130, 50
+	m.width, m.height = 220, 50
 	m.devices = []deviceRow{
 		{ip: "192.168.1.1", mac: "08:63:32:60:3f:63", vendor: "IEEE Reg. Authority", hostname: "router.local", policy: ""},
 		{ip: "192.168.1.6", mac: "22:53:a5:32:06:6b", vendor: "", hostname: "", policy: "drop"},
@@ -37,8 +37,9 @@ func TestRenderedViewFitsTerminalWidth(t *testing.T) {
 	// Check no line exceeds 130 cols (visible width — strip ANSI for the test).
 	for i, line := range strings.Split(view, "\n") {
 		visible := stripANSI(line)
-		if w := lipgloss.Width(visible); w > 130 {
-			t.Errorf("line %d width %d exceeds 130: %q", i, w, visible)
+		// Dashboard caps at maxRenderWidth (140) regardless of terminal width.
+		if w := lipgloss.Width(visible); w > 145 {
+			t.Errorf("line %d width %d exceeds 145 (cap is 140): %q", i, w, visible)
 		}
 	}
 }

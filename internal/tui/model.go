@@ -258,11 +258,21 @@ func policyTag(policy string) string {
 	return policy
 }
 
+// maxRenderWidth caps how wide the dashboard renders. On ultrawide terminals
+// (200+ cols) panels would otherwise stretch to ridiculous widths with most
+// of the area being blank, which looks empty and is hard to read across.
+// We render at ≤ maxRenderWidth and leave any remaining columns blank on
+// the right.
+const maxRenderWidth = 140
+
 func (m model) View() string {
 	totalW := m.width
 	if totalW < 70 {
 		return "shardflow tui needs ≥ 70 cols (you have " + fmt.Sprint(totalW) + ")\n" +
 			"resize your terminal and re-launch."
+	}
+	if totalW > maxRenderWidth {
+		totalW = maxRenderWidth
 	}
 
 	out := strings.Builder{}
