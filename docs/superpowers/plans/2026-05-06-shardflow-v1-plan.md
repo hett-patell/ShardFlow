@@ -3197,8 +3197,21 @@ func (m *Manager) Open(mac, ipStr, srcIface, dir string, maxBytes int64, maxAge 
 	if maxAge == 0 {
 		maxAge = DefaultMaxAge
 	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &writer{mac: mac, dir: dir, cancel: cancel, finished: make(chan struct{})}
+
+	// Stake the map slot under the mutex BEFORE spawning the goroutine, so
+	// a duplicate Open for the same MAC is rejected without leaking a
+	// goroutine, pcap handle, or open file.
+	m.mu.Lock()
+	if _, exists := m.writers[mac]; exists {
+		m.mu.Unlock()
+		cancel()
+		return fmt.Errorf("pcapwriter: already capturing %s", mac)
+	}
+	m.writers[mac] = w
+	m.mu.Unlock()
 
 	startup := make(chan error, 1)
 	go func() {
@@ -3206,13 +3219,14 @@ func (m *Manager) Open(mac, ipStr, srcIface, dir string, maxBytes int64, maxAge 
 		_ = runWriter(ctx, mac, ipStr, srcIface, dir, maxBytes, maxAge, startup)
 	}()
 	if err := <-startup; err != nil {
+		// Roll back the staked slot.
+		m.mu.Lock()
+		delete(m.writers, mac)
+		m.mu.Unlock()
 		cancel()
 		<-w.finished
 		return err
 	}
-	m.mu.Lock()
-	m.writers[mac] = w
-	m.mu.Unlock()
 	return nil
 }
 
@@ -3306,8 +3320,13 @@ func runWriter(ctx context.Context, mac, ipStr, srcIface, dir string, maxBytes i
 				written = 0
 			}
 			if err := w.WritePacket(pkt.Metadata().CaptureInfo, data); err != nil {
+				_ = w.Flush()
 				return err
 			}
+			// `written` tracks payload bytes only; pcap-ng framing adds
+			// ~28 bytes per packet plus fixed headers, so the on-disk file
+			// may exceed maxBytes by a small margin. v1 treats maxBytes as
+			// advisory.
 			written += int64(len(data))
 		}
 	}
