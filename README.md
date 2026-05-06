@@ -50,28 +50,36 @@ Build:
 make build
 ```
 
-Pick the interface you want to attack — usually your Wi-Fi or Ethernet:
+Now the easy way — one command, no flags, no interface picking, no two
+terminals. Auto-detects your default-route interface, boots the daemon,
+opens the TUI, cleans up when you quit:
 
 ```bash
-ip -4 addr show
-# look for the one with your LAN IP, e.g. wlp3s0 or enp2s0
+sudo ./scripts/shardflow-up
 ```
 
-Fire up the daemon (terminal 1):
+That's it. You're in the matrix. Hit `s` to scan, `j/k` to navigate,
+`d`/`t`/`p`/`x` to apply drop / throttle / pcap / clear. `q` to quit and
+pretend none of this happened — corrective ARPs are sent automatically so
+your victims regain functioning networks.
+
+If you want to pick a specific interface or socket path:
 
 ```bash
+sudo ./scripts/shardflow-up -i wlp3s0 -s /tmp/sf.sock
+```
+
+### The hard way (manual)
+
+If for some reason you'd rather run things yourself (cron, systemd, debugging):
+
+```bash
+# terminal 1: daemon
 sudo ./bin/shardflowd -i wlp3s0 -sock /tmp/sf.sock --force --clean-on-start
-```
 
-Open the dashboard (terminal 2):
-
-```bash
+# terminal 2: TUI
 sudo ./bin/shardflow --sock /tmp/sf.sock tui
 ```
-
-You're now in the matrix. Hit `s` to scan, `j/k` to navigate, `d`/`t`/`p`/`x`
-to apply drop / throttle / pcap / clear. `q` to quit and pretend none of this
-happened.
 
 ---
 

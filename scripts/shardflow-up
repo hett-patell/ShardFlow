@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# shardflow-up — one-shot launcher: start the daemon, wait for it, open the TUI.
+# On TUI exit, the daemon is shut down cleanly so we don't leak nft/tc state.
+#
+# Usage:
+#   sudo ./scripts/shardflow-up [-i <iface>] [-s <sock>]
+#
+# Defaults: iface auto-detected from the default route; sock=/tmp/sf.sock.
+set -euo pipefail
+
+IFACE=""
+SOCK="/tmp/sf.sock"
+PCAP_DIR="/tmp/sf-pcap"
+
+usage() {
+    cat <<EOF
+shardflow-up — boot the daemon and TUI together.
+
+Usage: sudo $0 [-i <iface>] [-s <sock>]
+
+  -i <iface>   network interface to operate on (default: auto-detect)
+  -s <sock>    Unix socket path (default: $SOCK)
+  -h           this help
+
+Hit q in the TUI to exit. The daemon is torn down automatically.
+EOF
+}
+
+while getopts "i:s:h" opt; do
+    case "$opt" in
+        i) IFACE="$OPTARG" ;;
+        s) SOCK="$OPTARG" ;;
+        h) usage; exit 0 ;;
+        *) usage; exit 2 ;;
+    esac
+done
+
+# Must run as root for raw sockets / nftables / tc.
+if [[ "$EUID" -ne 0 ]]; then
+    echo "shardflow-up: must run as root (try: sudo $0 $*)" >&2
+    exit 1
+fi
+
+# Auto-detect iface from the default route if not passed.
+if [[ -z "$IFACE" ]]; then
+    IFACE="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
+    if [[ -z "$IFACE" ]]; then
+        echo "shardflow-up: could not auto-detect interface — pass -i <iface>" >&2
+        exit 1
+    fi
+    echo "shardflow-up: auto-detected interface: $IFACE"
+fi
+
+# Resolve binary paths relative to this script so it works from anywhere.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DAEMON="$REPO_ROOT/bin/shardflowd"
+CLIENT="$REPO_ROOT/bin/shardflow"
+
+if [[ ! -x "$DAEMON" || ! -x "$CLIENT" ]]; then
+    echo "shardflow-up: binaries missing — run 'make build' first" >&2
+    exit 1
+fi
+
+mkdir -p "$PCAP_DIR"
+
+# Cleanup: on any exit, terminate the daemon so it runs its corrective ARPs
+# and tears down nft/tc state. We use SIGTERM, not SIGKILL, so the daemon's
+# signal handler fires.
+DAEMON_PID=""
+cleanup() {
+    if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+        echo "shardflow-up: shutting daemon down (PID $DAEMON_PID)..."
+        kill -TERM "$DAEMON_PID" 2>/dev/null || true
+        # Wait up to 5s for clean shutdown (corrective ARPs take ~1.6s).
+        for _ in $(seq 1 50); do
+            kill -0 "$DAEMON_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        # If still alive, hard-kill so we don't hang the shell.
+        kill -KILL "$DAEMON_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# Boot the daemon in the background. Stderr to a log file so it doesn't
+# trample on the TUI's screen.
+LOG_FILE="$(mktemp -t shardflowd-XXXXXX.log)"
+echo "shardflow-up: starting daemon — log: $LOG_FILE"
+"$DAEMON" -i "$IFACE" -sock "$SOCK" --force --clean-on-start \
+    -default-pcap-dir "$PCAP_DIR" >"$LOG_FILE" 2>&1 &
+DAEMON_PID=$!
+
+# Wait for the socket to actually appear AND be reachable.
+for i in $(seq 1 100); do
+    if [[ -S "$SOCK" ]] && "$CLIENT" --sock "$SOCK" stats >/dev/null 2>&1; then
+        break
+    fi
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        echo "shardflow-up: daemon died during startup. Last log:" >&2
+        tail -20 "$LOG_FILE" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+
+if ! "$CLIENT" --sock "$SOCK" stats >/dev/null 2>&1; then
+    echo "shardflow-up: daemon never became reachable. Last log:" >&2
+    tail -20 "$LOG_FILE" >&2
+    exit 1
+fi
+
+echo "shardflow-up: daemon ready on $SOCK — launching TUI..."
+sleep 0.3   # let the "ready" line settle out of the user's eye
+"$CLIENT" --sock "$SOCK" tui
+# When the TUI exits, the trap fires cleanup automatically.
