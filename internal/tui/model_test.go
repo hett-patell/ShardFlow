@@ -3,11 +3,23 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestScanningStateShowsInStatusBar(t *testing.T) {
+	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
+	m.width, m.height = 130, 50
+	m.scanning = true
+	m.scanStarted = time.Now().Add(-2 * time.Second)
+	view := m.View()
+	visible := stripANSI(view)
+	assert.Contains(t, visible, "SCANNING…", "scanning state must show in status bar")
+	assert.Contains(t, visible, "(2s)", "elapsed seconds must show")
+}
 
 func TestModelHandlesQuit(t *testing.T) {
 	m := newModel(nil, 200, "/var/lib/shardflow/pcap")

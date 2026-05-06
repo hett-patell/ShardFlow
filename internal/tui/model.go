@@ -36,6 +36,13 @@ type model struct {
 	height          int
 	defaultRateKbit int
 	defaultPcapDir  string
+
+	// Scan progress state. When the operator presses [S] we kick off a
+	// scan RPC which can take up to ~8s (2s active sweep + 3s mDNS +
+	// 3s SSDP, sequentially). Without explicit feedback the dashboard
+	// looks frozen for that whole window.
+	scanning    bool
+	scanStarted time.Time
 }
 
 func newModel(c *rpc.Client, defaultRateKbit int, defaultPcapDir string) model {
@@ -58,8 +65,24 @@ func (m model) update(msg tea.Msg) (model, tea.Cmd) {
 // tickMsg fires once a second for live clock + auto-refresh of devices.
 type tickMsg time.Time
 
+// spinnerTickMsg fires every 250ms but only while a scan is in progress
+// (Update arms the next one only if m.scanning). Drives the animated
+// spinner so it feels live without the regular 1Hz tick burning CPU.
+type spinnerTickMsg time.Time
+
 func tickEverySecond() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func spinnerTick() tea.Cmd {
+	return tea.Tick(250*time.Millisecond, func(t time.Time) tea.Msg { return spinnerTickMsg(t) })
+}
+
+// scanSpinnerFrame returns one frame of a braille spinner animation.
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+func scanSpinnerFrame(tick int) string {
+	return spinnerFrames[tick%len(spinnerFrames)]
 }
 
 func (m model) Init() tea.Cmd {
@@ -99,7 +122,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.defaultRateKbit, m.defaultPcapDir)
 		}
 		if _, ok := keyMatch(msg, "sS"); ok {
-			return m, tea.Batch(scanCmd(m.client), refreshDevicesCmd(m.client))
+			if m.scanning {
+				return m, nil // already scanning, ignore re-presses
+			}
+			m.scanning = true
+			m.scanStarted = time.Now()
+			return m, tea.Batch(scanCmd(m.client), spinnerTick())
 		}
 
 	case devicesLoadedMsg:
@@ -132,6 +160,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(tickEverySecond(), refreshDevicesCmd(m.client))
 		}
 		return m, tickEverySecond()
+
+	case spinnerTickMsg:
+		// Only re-arm while scanning is still in flight. The View() will
+		// re-render with the next spinner frame.
+		m.tickCount++
+		if m.scanning {
+			return m, spinnerTick()
+		}
+		return m, nil
+
+	case scanCompleteMsg:
+		m.scanning = false
+		elapsed := msg.elapsed.Truncate(time.Millisecond)
+		var line string
+		if msg.err != nil {
+			line = fmt.Sprintf("%s  ✗ scan failed (%s): %s",
+				time.Now().Format("15:04:05"), elapsed, msg.err)
+		} else {
+			line = fmt.Sprintf("%s  ✓ scan complete (%s, %d devices)",
+				time.Now().Format("15:04:05"), elapsed, msg.deviceCount)
+		}
+		m.logLines = append(m.logLines, line)
+		return m, refreshDevicesCmd(m.client)
 
 	case disconnectedMsg:
 		m.logLines = append(m.logLines, time.Now().Format("15:04:05")+"  ✗ daemon disconnected")
@@ -223,6 +274,7 @@ var (
 			Background(lipgloss.Color("#0a0a0a")).
 			Padding(0, 1).
 			Bold(true)
+	scanSpinningStyle = lipgloss.NewStyle().Foreground(amber).Bold(true)
 )
 
 const banner = `███████╗██╗  ██╗ █████╗ ██████╗ ██████╗ ███████╗██╗      ██████╗ ██╗    ██╗
@@ -286,8 +338,14 @@ func (m model) View() string {
 			policies++
 		}
 	}
-	statusText := fmt.Sprintf(" ◉ devices: %d    ⊘ active-policies: %d    ⏱ %s ",
-		len(m.devices), policies, m.lastTick.Format("15:04:05"))
+	scanFragment := ""
+	if m.scanning {
+		elapsed := time.Since(m.scanStarted).Truncate(time.Second)
+		scanFragment = "    " + scanSpinningStyle.Render(
+			scanSpinnerFrame(m.tickCount)+fmt.Sprintf(" SCANNING… (%s)", elapsed))
+	}
+	statusText := fmt.Sprintf(" ◉ devices: %d    ⊘ active-policies: %d    ⏱ %s%s ",
+		len(m.devices), policies, m.lastTick.Format("15:04:05"), scanFragment)
 	out.WriteString(statusBar.Width(totalW).Render(statusText))
 	out.WriteString("\n\n")
 
@@ -529,3 +587,11 @@ type eventMsg struct {
 type devicesLoadedMsg struct{ rows []deviceRow }
 
 type disconnectedMsg struct{}
+
+// scanCompleteMsg is delivered when an [S]-triggered scan returns. The
+// model uses it to clear the scanning flag and log a result line.
+type scanCompleteMsg struct {
+	err         error
+	elapsed     time.Duration
+	deviceCount int
+}

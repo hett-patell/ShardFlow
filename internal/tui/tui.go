@@ -4,6 +4,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -102,10 +103,19 @@ func applyPolicyCmd(c *rpc.Client, target string, key rune, defaultRateKbit int,
 	}
 }
 
+// scanCmd issues a Scan RPC and returns scanCompleteMsg with the elapsed
+// time and current device count. The RPC blocks for the full scan window
+// (~8s) — the model uses the .scanning flag to show a spinner during that
+// time so the dashboard isn't visibly frozen.
 func scanCmd(c *rpc.Client) tea.Cmd {
 	return func() tea.Msg {
+		start := time.Now()
 		var r map[string]string
-		_ = c.Call(context.Background(), rpc.MethodScan, nil, &r)
-		return eventMsg{text: "scan triggered"}
+		err := c.Call(context.Background(), rpc.MethodScan, nil, &r)
+		elapsed := time.Since(start)
+		// Best-effort device count.
+		var devs []rpc.DeviceDTO
+		_ = c.Call(context.Background(), rpc.MethodDevicesList, nil, &devs)
+		return scanCompleteMsg{err: err, elapsed: elapsed, deviceCount: len(devs)}
 	}
 }
