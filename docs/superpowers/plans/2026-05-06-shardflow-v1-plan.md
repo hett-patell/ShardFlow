@@ -4147,6 +4147,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/hett-patell/ShardFlow/internal/arpengine"
@@ -4179,10 +4180,19 @@ type HandlerDeps struct {
 	// DefaultPcapDir is applied when Policy.Set's pcap_dir is empty. If
 	// also empty the handler rejects the request with InvalidParams.
 	DefaultPcapDir string
+
+	// applyMu serialises the snapshot→modify→Apply sequence in setPolicy
+	// and clearPolicy so concurrent handler invocations can't clobber
+	// each other with stale snapshots. Compiler.Apply has its own mutex
+	// but that only makes each Apply atomic — it doesn't cover the
+	// handler-level RMW. HandlerDeps must therefore be passed by pointer
+	// to BuildHandlers so closures share the same lock.
+	applyMu sync.Mutex
 }
 
-// BuildHandlers returns the method table from a HandlerDeps.
-func BuildHandlers(d HandlerDeps) map[string]Handler {
+// BuildHandlers returns the method table from a HandlerDeps. Pointer
+// receiver so closures share applyMu across the seven handlers.
+func BuildHandlers(d *HandlerDeps) map[string]Handler {
 	return map[string]Handler{
 		MethodScan: func(ctx context.Context, _ json.RawMessage) (any, *Error) {
 			if err := d.Scanner(ctx); err != nil {
@@ -4250,7 +4260,7 @@ func BuildHandlers(d HandlerDeps) map[string]Handler {
 	}
 }
 
-func setPolicy(ctx context.Context, d HandlerDeps, p PolicySpec) (any, *Error) {
+func setPolicy(ctx context.Context, d *HandlerDeps, p PolicySpec) (any, *Error) {
 	mac, ferr := resolveTarget(d.Store, p.Target)
 	if ferr != nil {
 		return nil, ferr
@@ -4280,9 +4290,12 @@ func setPolicy(ctx context.Context, d HandlerDeps, p PolicySpec) (any, *Error) {
 			spec.PcapDir = p.PcapDir
 		}
 	}
+	d.applyMu.Lock()
 	desired := d.Compiler.Snapshot()
 	desired[mac.String()] = spec
-	if err := d.Compiler.Apply(ctx, desired); err != nil {
+	err := d.Compiler.Apply(ctx, desired)
+	d.applyMu.Unlock()
+	if err != nil {
 		return nil, &Error{Code: CodeInternalError, Message: err.Error()}
 	}
 	if d.Broadcaster != nil {
@@ -4294,14 +4307,17 @@ func setPolicy(ctx context.Context, d HandlerDeps, p PolicySpec) (any, *Error) {
 	return map[string]string{"status": "applied"}, nil
 }
 
-func clearPolicy(ctx context.Context, d HandlerDeps, target string) (any, *Error) {
+func clearPolicy(ctx context.Context, d *HandlerDeps, target string) (any, *Error) {
 	mac, ferr := resolveTarget(d.Store, target)
 	if ferr != nil {
 		return nil, ferr
 	}
+	d.applyMu.Lock()
 	desired := d.Compiler.Snapshot()
 	delete(desired, mac.String())
-	if err := d.Compiler.Apply(ctx, desired); err != nil {
+	err := d.Compiler.Apply(ctx, desired)
+	d.applyMu.Unlock()
+	if err != nil {
 		return nil, &Error{Code: CodeInternalError, Message: err.Error()}
 	}
 	if d.Broadcaster != nil {
