@@ -11,6 +11,12 @@ import (
 	"github.com/hett-patell/ShardFlow/internal/rpc"
 )
 
+// frameSize is the extra width that panelBox occupies beyond what its
+// `Width()` call sets — for our `RoundedBorder() + Padding(0,1)` style,
+// lipgloss puts the padding INSIDE the Width() and the border OUTSIDE,
+// so external = Width() + 2 (one border char on each side).
+const frameSize = 2
+
 type deviceRow struct {
 	ip       string
 	mac      string
@@ -25,6 +31,7 @@ type model struct {
 	cursor          int
 	logLines        []string
 	lastTick        time.Time
+	tickCount       int
 	width           int
 	height          int
 	defaultRateKbit int
@@ -35,7 +42,7 @@ func newModel(c *rpc.Client, defaultRateKbit int, defaultPcapDir string) model {
 	return model{
 		client:          c,
 		lastTick:        time.Now(),
-		width:           120, // sane default until WindowSizeMsg arrives
+		width:           120,
 		height:          40,
 		defaultRateKbit: defaultRateKbit,
 		defaultPcapDir:  defaultPcapDir,
@@ -85,9 +92,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		// Policy keys: D drop, T throttle, P pcap; C or X to clear/restore.
-		// Lowercase and uppercase both work — a panicking operator should
-		// not have to remember which case fires the kill switch.
+		// D/T/P drop/throttle/pcap; C/X/R clear/restore. Both cases.
 		if r, ok := keyMatch(msg, "dDtTpPxXcCrR"); ok && len(m.devices) > 0 {
 			actionKey := normalizePolicyKey(r)
 			return m, applyPolicyCmd(m.client, m.devices[m.cursor].ip, actionKey,
@@ -104,8 +109,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case eventMsg:
-		// Filter out the noisy 1Hz counter heartbeat — it's just a clock
-		// from the daemon, not something an operator wants in their log.
+		// Skip the noisy 1Hz counter heartbeat.
 		if !strings.HasPrefix(msg.text, "counters.tick") {
 			stamped := time.Now().Format("15:04:05") + "  " + msg.text
 			m.logLines = append(m.logLines, stamped)
@@ -121,10 +125,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.lastTick = time.Time(msg)
-		// Auto-refresh device list every 3 ticks (3s) so the dashboard
-		// stays fresh even if no events fired (e.g., poison kept devices
-		// quiet on the wire).
-		if int(m.lastTick.Unix())%3 == 0 {
+		m.tickCount++
+		// Every 3 seconds, force a device-list refresh so the screen
+		// stays current even if no daemon events fire.
+		if m.tickCount%3 == 0 {
 			return m, tea.Batch(tickEverySecond(), refreshDevicesCmd(m.client))
 		}
 		return m, tickEverySecond()
@@ -137,8 +141,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // normalizePolicyKey maps both cases and the alt clear-keys onto the four
-// canonical actions ('d' drop, 't' throttle, 'p' pcap, 'x' clear) that the
-// underlying applyPolicyCmd already understands.
+// canonical actions ('d' drop, 't' throttle, 'p' pcap, 'x' clear).
 func normalizePolicyKey(r rune) rune {
 	switch r {
 	case 'd', 'D':
@@ -163,21 +166,30 @@ var (
 	dim         = lipgloss.Color("#7a7a7a")
 	deeperDim   = lipgloss.Color("#3a3a3a")
 	whiteBright = lipgloss.Color("#ffffff")
+	selectBG    = lipgloss.Color("#1a3d2e") // muted forest-green for selection bg
 
 	bannerStyle = lipgloss.NewStyle().Foreground(neonGreen).Bold(true)
 	subBanner   = lipgloss.NewStyle().Foreground(cyan).Italic(true)
 
-	headerCol   = lipgloss.NewStyle().Foreground(dim).Bold(true)
-	rowDim      = lipgloss.NewStyle().Foreground(dim)
-	rowSelected = lipgloss.NewStyle().Foreground(whiteBright).Background(lipgloss.Color("#003a22")).Bold(true)
-	macStyle    = lipgloss.NewStyle().Foreground(amber)
-	ipStyle     = lipgloss.NewStyle().Foreground(cyan)
-	vendorStyle = lipgloss.NewStyle().Foreground(neonGreen)
-	hostStyle   = lipgloss.NewStyle().Foreground(whiteBright)
-	dropTag     = lipgloss.NewStyle().Foreground(hotPink).Bold(true)
+	headerCol = lipgloss.NewStyle().Foreground(dim).Bold(true)
+	rowDim    = lipgloss.NewStyle().Foreground(dim)
+	macStyle  = lipgloss.NewStyle().Foreground(amber)
+	ipStyle   = lipgloss.NewStyle().Foreground(cyan)
+	venStyle  = lipgloss.NewStyle().Foreground(neonGreen)
+	hostStyle = lipgloss.NewStyle().Foreground(whiteBright)
+	dropTag   = lipgloss.NewStyle().Foreground(hotPink).Bold(true)
 	throttleTag = lipgloss.NewStyle().Foreground(amber).Bold(true)
 	pcapTag     = lipgloss.NewStyle().Foreground(cyan).Bold(true)
 	noPolicy    = lipgloss.NewStyle().Foreground(deeperDim)
+
+	// The selected row uses a single all-row style with background + bold.
+	// Inner per-cell colors are intentionally NOT applied to the selected
+	// row — otherwise the cell-foreground colors override the highlight
+	// foreground and the user can't tell what's selected.
+	selRowStyle = lipgloss.NewStyle().
+			Foreground(whiteBright).
+			Background(selectBG).
+			Bold(true)
 
 	keyChip = lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#000000")).
@@ -201,7 +213,7 @@ var (
 			Padding(0, 1)
 	keyDesc = lipgloss.NewStyle().Foreground(whiteBright)
 
-	panelTitle = lipgloss.NewStyle().Foreground(neonGreen).Bold(true).Padding(0, 1)
+	panelTitle = lipgloss.NewStyle().Foreground(neonGreen).Bold(true)
 	panelBox   = lipgloss.NewStyle().
 			BorderStyle(lipgloss.RoundedBorder()).
 			BorderForeground(deeperDim).
@@ -209,20 +221,27 @@ var (
 	statusBar = lipgloss.NewStyle().
 			Foreground(neonGreen).
 			Background(lipgloss.Color("#0a0a0a")).
-			Padding(0, 1)
+			Padding(0, 1).
+			Bold(true)
 )
 
-const banner = `
-███████╗██╗  ██╗ █████╗ ██████╗ ██████╗ ███████╗██╗      ██████╗ ██╗    ██╗
+const banner = `███████╗██╗  ██╗ █████╗ ██████╗ ██████╗ ███████╗██╗      ██████╗ ██╗    ██╗
 ██╔════╝██║  ██║██╔══██╗██╔══██╗██╔══██╗██╔════╝██║     ██╔═══██╗██║    ██║
 ███████╗███████║███████║██████╔╝██║  ██║█████╗  ██║     ██║   ██║██║ █╗ ██║
 ╚════██║██╔══██║██╔══██║██╔══██╗██║  ██║██╔══╝  ██║     ██║   ██║██║███╗██║
 ███████║██║  ██║██║  ██║██║  ██║██████╔╝██║     ███████╗╚██████╔╝╚███╔███╔╝
 ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝     ╚══════╝ ╚═════╝  ╚══╝╚══╝ `
 
-func renderBanner() string {
+const bannerSmall = `╔═══════════════╗
+║   SHARDFLOW   ║
+╚═══════════════╝`
+
+func renderBanner(width int) string {
+	if width < 80 {
+		return bannerStyle.Render(bannerSmall)
+	}
 	return bannerStyle.Render(banner) + "\n" +
-		subBanner.Render("                       L A N   w o r k b e n c h  ::  authorized pentest only")
+		subBanner.Render("           L A N   w o r k b e n c h  ::  authorized pentest only")
 }
 
 func policyTag(policy string) string {
@@ -240,15 +259,14 @@ func policyTag(policy string) string {
 }
 
 func (m model) View() string {
-	if m.width < 80 {
-		// Tiny terminal — keep something usable rather than mis-aligned.
-		return "shardflow tui needs ≥ 80 cols (you have " + fmt.Sprint(m.width) + ")"
+	totalW := m.width
+	if totalW < 70 {
+		return "shardflow tui needs ≥ 70 cols (you have " + fmt.Sprint(totalW) + ")\n" +
+			"resize your terminal and re-launch."
 	}
 
-	totalW := m.width
-
 	out := strings.Builder{}
-	out.WriteString(renderBanner())
+	out.WriteString(renderBanner(totalW))
 	out.WriteString("\n\n")
 
 	// === STATUS BAR ===
@@ -263,29 +281,33 @@ func (m model) View() string {
 	out.WriteString(statusBar.Width(totalW).Render(statusText))
 	out.WriteString("\n\n")
 
-	// === DEVICES + TARGET PANELS ===
-	rightW := 30
-	leftW := totalW - rightW - 4 // 4 = padding/borders allowance
-	if leftW < 60 {
-		leftW = 60
+	// === DEVICES + TARGET (horizontal pair) ===
+	// outer-width math: leftOuter + 2 (separator) + rightOuter == totalW
+	// where outer = inner + frameSize (the border).
+	rightInner := 32
+	if totalW < 110 {
+		rightInner = 28
 	}
+	rightOuter := rightInner + frameSize
+	leftOuter := totalW - rightOuter - 2 // 2 = "  " separator
+	leftInner := leftOuter - frameSize
 
-	left := renderDevicesPanel(m, leftW)
-	right := renderTargetPanel(m, rightW)
+	left := renderDevicesPanel(m, leftInner)
+	right := renderTargetPanel(m, rightInner)
 	panels := lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right)
 	out.WriteString(panels)
 	out.WriteString("\n\n")
 
-	// === ATTACK PANEL (big keys) ===
-	out.WriteString(renderAttackPanel(totalW))
+	// === ATTACK PANEL (full width) ===
+	out.WriteString(renderAttackPanel(totalW - frameSize))
 	out.WriteString("\n\n")
 
-	// === EVENT LOG ===
-	out.WriteString(renderLogPanel(m, totalW))
+	// === EVENT LOG (full width) ===
+	out.WriteString(renderLogPanel(m, totalW-frameSize))
 	out.WriteString("\n")
 
 	// === BOTTOM HELP ===
-	out.WriteString(rowDim.Render(" ") +
+	out.WriteString(" " +
 		keyChip.Render("J/K") + " " + keyDesc.Render("move") + "    " +
 		keyChip.Render("S") + " " + keyDesc.Render("scan") + "    " +
 		keyChip.Render("Q") + " " + keyDesc.Render("quit"))
@@ -294,58 +316,133 @@ func (m model) View() string {
 	return out.String()
 }
 
-func renderDevicesPanel(m model, width int) string {
+// Column widths for the devices list. Tuned so a row fits comfortably in
+// inner widths ≥ ~88 chars (covered by terminals ≥ 100 cols). Total row
+// content = 1 (lead) + 15 + 2 + 17 + 2 + 18 + 2 + 22 + 2 + 8 = 89 chars.
+const (
+	colIP     = 15
+	colMAC    = 17
+	colVendor = 18
+	colHost   = 22
+	colPolicy = 8
+)
+
+func renderDevicesPanel(m model, innerWidth int) string {
 	body := strings.Builder{}
 	body.WriteString(panelTitle.Render(fmt.Sprintf("┳ DEVICES [%d]", len(m.devices))))
 	body.WriteString("\n")
-	body.WriteString(headerCol.Render(fmt.Sprintf(" %-15s  %-17s  %-22s  %-25s  %s",
-		"IP", "MAC", "VENDOR", "HOSTNAME", "POLICY")))
+	body.WriteString(headerCol.Render(fmt.Sprintf(" %-*s  %-*s  %-*s  %-*s  %-*s",
+		colIP, "IP", colMAC, "MAC", colVendor, "VENDOR",
+		colHost, "HOSTNAME", colPolicy, "POLICY")))
 	body.WriteString("\n")
 	if len(m.devices) == 0 {
 		body.WriteString(rowDim.Render(" (no devices yet — press [s] to scan)"))
 		body.WriteString("\n")
+		return panelBox.Width(innerWidth).Render(body.String())
 	}
 	for i, d := range m.devices {
-		ip := ipStyle.Render(fmt.Sprintf("%-15s", d.ip))
-		mac := macStyle.Render(fmt.Sprintf("%-17s", d.mac))
-		vendor := truncate(d.vendor, 22)
+		vendor := truncate(d.vendor, colVendor)
 		if vendor == "" {
 			vendor = "—"
 		}
-		hostname := truncate(d.hostname, 25)
+		hostname := truncate(d.hostname, colHost)
 		if hostname == "" {
 			hostname = "—"
 		}
-		ven := vendorStyle.Render(fmt.Sprintf("%-22s", vendor))
-		host := hostStyle.Render(fmt.Sprintf("%-25s", hostname))
-		tag := policyTag(d.policy)
+		policy := compactPolicyText(d.policy)
 
-		row := fmt.Sprintf(" %s  %s  %s  %s  %s", ip, mac, ven, host, tag)
+		// Plain padded row — used for selected variant where outer style
+		// must own the whole line.
+		plain := fmt.Sprintf(" %-*s  %-*s  %-*s  %-*s  %-*s",
+			colIP, d.ip, colMAC, d.mac,
+			colVendor, vendor, colHost, hostname,
+			colPolicy, policy)
+
 		if i == m.cursor {
-			body.WriteString(rowSelected.Render("▶" + row))
+			body.WriteString(selRowStyle.Render("▶" + plain[1:]))
 		} else {
-			body.WriteString(" " + row)
+			// Non-selected: per-cell color, identical layout.
+			ip := ipStyle.Render(fmt.Sprintf("%-*s", colIP, d.ip))
+			mac := macStyle.Render(fmt.Sprintf("%-*s", colMAC, d.mac))
+			ven := venStyle.Render(fmt.Sprintf("%-*s", colVendor, vendor))
+			host := hostStyle.Render(fmt.Sprintf("%-*s", colHost, hostname))
+			tag := compactPolicyTag(d.policy, colPolicy)
+			body.WriteString(fmt.Sprintf(" %s  %s  %s  %s  %s", ip, mac, ven, host, tag))
 		}
 		body.WriteString("\n")
 	}
-	return panelBox.Width(width).Render(body.String())
+	return panelBox.Width(innerWidth).Render(body.String())
 }
 
-func renderTargetPanel(m model, width int) string {
+// compactPolicyText is the un-styled, fixed-width text form for the
+// devices-list policy column. ≤ colPolicy (8) visible chars so the row
+// budget never overflows.
+func compactPolicyText(p string) string {
+	switch {
+	case p == "" || p == "—":
+		return "·"
+	case p == "drop":
+		return "⊘ DROP"
+	case strings.HasPrefix(p, "throttle"):
+		// "throttle 200kbit" → "◐ 200K" (6 visual cells, well under 8)
+		rest := strings.TrimSpace(strings.TrimPrefix(p, "throttle"))
+		rest = strings.TrimSuffix(rest, "bit")
+		rest = strings.ToUpper(rest)
+		if rest == "" {
+			return "◐ THR"
+		}
+		return "◐ " + rest
+	case p == "pcap":
+		return "◉ PCAP"
+	}
+	return p
+}
+
+func compactPolicyTag(p string, width int) string {
+	text := compactPolicyText(p)
+	// pad-or-truncate to `width` visible columns
+	if lipglossWidth(text) < width {
+		text = text + strings.Repeat(" ", width-lipglossWidth(text))
+	}
+	switch {
+	case p == "drop":
+		return dropTag.Render(text)
+	case strings.HasPrefix(p, "throttle"):
+		return throttleTag.Render(text)
+	case p == "pcap":
+		return pcapTag.Render(text)
+	}
+	return noPolicy.Render(text)
+}
+
+// lipglossWidth returns the visible width of s. Wraps lipgloss.Width so we
+// don't have to import lipgloss in every spot.
+func lipglossWidth(s string) int {
+	return lipgloss.Width(s)
+}
+
+func renderTargetPanel(m model, innerWidth int) string {
 	body := strings.Builder{}
 	body.WriteString(panelTitle.Render("┳ TARGET"))
 	body.WriteString("\n")
 	if len(m.devices) > 0 {
 		d := m.devices[m.cursor]
-		body.WriteString(rowDim.Render("ip      ") + ipStyle.Render(d.ip) + "\n")
-		body.WriteString(rowDim.Render("mac     ") + macStyle.Render(d.mac) + "\n")
+		// "label  " is 8 chars; add the panel's own (0,1) padding ⇒ 10 chars
+		// of overhead inside Width(innerWidth). Truncate values to whatever
+		// remains so they don't wrap.
+		fieldW := innerWidth - 10
+		if fieldW < 8 {
+			fieldW = 8
+		}
+		body.WriteString(rowDim.Render("ip      ") + ipStyle.Render(truncate(d.ip, fieldW)) + "\n")
+		body.WriteString(rowDim.Render("mac     ") + macStyle.Render(truncate(d.mac, fieldW)) + "\n")
 		if d.vendor != "" {
-			body.WriteString(rowDim.Render("vendor  ") + vendorStyle.Render(truncate(d.vendor, width-10)) + "\n")
+			body.WriteString(rowDim.Render("vendor  ") + venStyle.Render(truncate(d.vendor, fieldW)) + "\n")
 		} else {
 			body.WriteString(rowDim.Render("vendor  ") + noPolicy.Render("—") + "\n")
 		}
 		if d.hostname != "" {
-			body.WriteString(rowDim.Render("host    ") + hostStyle.Render(truncate(d.hostname, width-10)) + "\n")
+			body.WriteString(rowDim.Render("host    ") + hostStyle.Render(truncate(d.hostname, fieldW)) + "\n")
 		} else {
 			body.WriteString(rowDim.Render("host    ") + noPolicy.Render("—") + "\n")
 		}
@@ -353,10 +450,10 @@ func renderTargetPanel(m model, width int) string {
 	} else {
 		body.WriteString(rowDim.Render("(no target selected)\n"))
 	}
-	return panelBox.Width(width).Render(body.String())
+	return panelBox.Width(innerWidth).Render(body.String())
 }
 
-func renderAttackPanel(width int) string {
+func renderAttackPanel(innerWidth int) string {
 	body := strings.Builder{}
 	body.WriteString(panelTitle.Render("┳ ATTACK") + "\n")
 
@@ -366,24 +463,25 @@ func renderAttackPanel(width int) string {
 		keyChip.Render(" C ") + " " + keyDesc.Render("CLEAR — restore device, send corrective ARP")
 
 	body.WriteString(" " + row1 + "\n")
-	body.WriteString(" " + row2 + "\n")
-	return panelBox.Width(width).Render(body.String())
+	body.WriteString(" " + row2)
+	return panelBox.Width(innerWidth).Render(body.String())
 }
 
-func renderLogPanel(m model, width int) string {
+func renderLogPanel(m model, innerWidth int) string {
 	body := strings.Builder{}
 	body.WriteString(panelTitle.Render("┳ EVENT LOG") + "\n")
 	logs := tail(m.logLines, 8)
 	if len(logs) == 0 {
 		body.WriteString(rowDim.Render(" (quiet — daemon events will appear here)"))
-		body.WriteString("\n")
 	} else {
-		for _, line := range logs {
+		for i, line := range logs {
 			body.WriteString(" " + rowDim.Render(line))
-			body.WriteString("\n")
+			if i < len(logs)-1 {
+				body.WriteString("\n")
+			}
 		}
 	}
-	return panelBox.Width(width).Render(body.String())
+	return panelBox.Width(innerWidth).Render(body.String())
 }
 
 func max0(n int) int {
