@@ -3568,10 +3568,14 @@ In `internal/policycompiler/compiler.go`:
 package policycompiler
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 	"sync"
+
+	"github.com/hett-patell/ShardFlow/internal/arpengine"
 )
 
 // Compiler orchestrates the four effectors.
@@ -3659,6 +3663,12 @@ func (c *Compiler) Apply(ctx context.Context, desired map[string]Spec) error {
 				continue // can't safely build over partial old state
 			}
 			delete(c.current, mac)
+		}
+		// Guard: if the mac is still present (phase 1 teardown failed for a
+		// kind change), don't try to layer the new policy on top of stale
+		// kernel state. Caller will retry on next Apply.
+		if _, stillStale := c.current[mac]; stillStale {
+			continue
 		}
 		if err := c.bringUpOne(ctx, want); err != nil {
 			record(err)
@@ -3788,7 +3798,7 @@ func specsEqual(a, b Spec) bool {
 	if !a.Target.IP.Equal(b.Target.IP) {
 		return false
 	}
-	if !bytesEq(a.Target.GwMAC, b.Target.GwMAC) {
+	if !bytes.Equal(a.Target.GwMAC, b.Target.GwMAC) {
 		return false
 	}
 	if !a.Target.GwIP.Equal(b.Target.GwIP) {
@@ -3797,27 +3807,27 @@ func specsEqual(a, b Spec) bool {
 	return true
 }
 
-func bytesEq(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// Snapshot returns a copy of the current desired state.
+// Snapshot returns a deep copy of the current desired state. Target slice
+// fields are copied so callers can't corrupt internal state by mutating
+// the returned bytes.
 func (c *Compiler) Snapshot() map[string]Spec {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	out := make(map[string]Spec, len(c.current))
 	for k, v := range c.current {
+		v.Target = copyTarget(v.Target)
 		out[k] = v
 	}
 	return out
+}
+
+func copyTarget(t arpengine.Target) arpengine.Target {
+	return arpengine.Target{
+		MAC:   append(net.HardwareAddr{}, t.MAC...),
+		IP:    append(net.IP{}, t.IP...),
+		GwMAC: append(net.HardwareAddr{}, t.GwMAC...),
+		GwIP:  append(net.IP{}, t.GwIP...),
+	}
 }
 ```
 
