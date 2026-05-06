@@ -4511,10 +4511,6 @@ func run() (err error) {
 	shutdown := func() {
 		shutdownOnce.Do(func() {
 			_ = arp.StopAll()
-			// Apply empty desired-state: tears down every target, removing
-			// per-mark redirect/mirror filters from the real iface ingress.
-			// Without this, shardflow0 / shardflow-cap could be removed
-			// while filters still reference them by name.
 			_ = comp.Apply(context.Background(), map[string]policycompiler.Spec{})
 			_ = nft.Teardown(context.Background())
 			_ = pc.CloseAll()
@@ -4525,6 +4521,25 @@ func run() (err error) {
 		if err != nil {
 			shutdown()
 		}
+	}()
+
+	// Forward-declare srv so the signal handler closure can reference it
+	// even before rpc.NewServer is called.
+	var srv *rpc.Server
+
+	// Install the signal handler BEFORE any kernel-mutating EnsureX call
+	// so a SIGINT/SIGTERM during startup runs the same shutdown path
+	// instead of orphaning newly-created kernel state.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		fmt.Fprintln(os.Stderr, "shardflowd: shutting down")
+		if srv != nil {
+			_ = srv.Stop()
+		}
+		shutdown()
+		cancel()
 	}()
 
 	if err := nft.EnsureTables(ctx, info.Name); err != nil {
@@ -4567,9 +4582,6 @@ func run() (err error) {
 		return nil
 	}
 
-	// Forward declaration so the broadcaster closure can refer to srv
-	// before it is constructed (Go closures capture by reference).
-	var srv *rpc.Server
 	handlers := rpc.BuildHandlers(&rpc.HandlerDeps{
 		Store:    store,
 		Compiler: comp,
@@ -4586,24 +4598,33 @@ func run() (err error) {
 	})
 	srv = rpc.NewServer(handlers)
 
-	// Bridge devicestore subscription → server broadcast. Convert to the
-	// DTO wire form so clients (TUI, CLI --json) get string-form IPs/MACs
-	// rather than base64 byte arrays.
+	// Bridge devicestore subscription → server broadcast. Selects on
+	// ctx.Done() so the goroutine exits cleanly on shutdown; defers
+	// Unsubscribe so the store doesn't keep a dead subscriber slot.
 	go func() {
 		ch := store.Subscribe()
-		for ev := range ch {
-			method := rpc.EventDeviceUpdated
-			if ev.Kind == devicestore.EventDiscovered {
-				method = rpc.EventDeviceDiscovered
+		defer store.Unsubscribe(ch)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev, ok := <-ch:
+				if !ok {
+					return
+				}
+				method := rpc.EventDeviceUpdated
+				if ev.Kind == devicestore.EventDiscovered {
+					method = rpc.EventDeviceDiscovered
+				}
+				dto := rpc.DeviceDTO{
+					MAC:      ev.Device.MAC.String(),
+					IP:       ev.Device.IP.String(),
+					Hostname: ev.Device.Hostname,
+					Vendor:   ev.Device.Vendor,
+					LastSeen: ev.Device.LastSeen.Format(time.RFC3339),
+				}
+				srv.Broadcast(method, dto)
 			}
-			dto := rpc.DeviceDTO{
-				MAC:      ev.Device.MAC.String(),
-				IP:       ev.Device.IP.String(),
-				Hostname: ev.Device.Hostname,
-				Vendor:   ev.Device.Vendor,
-				LastSeen: ev.Device.LastSeen.Format(time.RFC3339),
-			}
-			srv.Broadcast(method, dto)
 		}
 	}()
 
@@ -4621,16 +4642,8 @@ func run() (err error) {
 		}
 	}()
 
-	// Signal handling: invoke shutdown (idempotent) and exit.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sig
-		fmt.Fprintln(os.Stderr, "shardflowd: shutting down")
-		_ = srv.Stop()
-		shutdown()
-		cancel()
-	}()
+	// (Signal handling is registered earlier, before kernel-mutating
+	// EnsureX calls — see above.)
 
 	if err := srv.Listen(ctx, *sockFlag); err != nil {
 		return err
