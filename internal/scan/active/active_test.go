@@ -27,3 +27,18 @@ func TestBuildARPRequestFrame(t *testing.T) {
 	assert.Equal(t, uint16(layers.ARPRequest), arp.Operation)
 	assert.Equal(t, "10.0.0.42", net.IP(arp.DstProtAddress).String())
 }
+
+func TestNextIPCarry(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"10.0.0.0", "10.0.0.1"},
+		{"10.0.0.254", "10.0.0.255"},
+		{"10.0.0.255", "10.0.1.0"},
+		{"10.0.255.255", "10.1.0.0"},
+	}
+	for _, tc := range cases {
+		got := nextIP(net.ParseIP(tc.in).To4())
+		assert.Equal(t, tc.want, got.String(), "nextIP(%s)", tc.in)
+	}
+}
