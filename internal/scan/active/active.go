@@ -14,6 +14,7 @@ import (
 	"github.com/google/gopacket/pcap"
 
 	"github.com/hett-patell/ShardFlow/internal/devicestore"
+	"github.com/hett-patell/ShardFlow/internal/oui"
 )
 
 // Sweep sends ARP requests for every host in cidr from the operator's
@@ -64,10 +65,12 @@ func Sweep(ctx context.Context, ifaceName string, srcMAC net.HardwareAddr, srcIP
 				if arp.Operation != layers.ARPReply {
 					continue
 				}
+				mac := net.HardwareAddr(append([]byte{}, arp.SourceHwAddress...))
 				obs := devicestore.Observation{
-					MAC:  net.HardwareAddr(append([]byte{}, arp.SourceHwAddress...)),
-					IP:   net.IP(append([]byte{}, arp.SourceProtAddress...)),
-					Seen: time.Now(),
+					MAC:    mac,
+					IP:     net.IP(append([]byte{}, arp.SourceProtAddress...)),
+					Vendor: oui.Lookup(mac),
+					Seen:   time.Now(),
 				}
 				onObs(obs)
 			}

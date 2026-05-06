@@ -100,9 +100,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	headerStyle := lipgloss.NewStyle().Bold(true)
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+
 	left := strings.Builder{}
 	left.WriteString(headerStyle.Render(fmt.Sprintf("Devices (%d)", len(m.devices))))
 	left.WriteString("\n")
+	left.WriteString(dimStyle.Render(fmt.Sprintf("  %-15s %-17s %-22s %-20s %s\n",
+		"IP", "MAC", "VENDOR", "HOSTNAME", "POLICY")))
 	for i, d := range m.devices {
 		marker := "  "
 		if i == m.cursor {
@@ -112,7 +116,16 @@ func (m model) View() string {
 		if policy == "" {
 			policy = "—"
 		}
-		left.WriteString(fmt.Sprintf("%s%-15s %-12s %-20s [%s]\n", marker, d.ip, d.mac, d.hostname, policy))
+		vendor := truncate(d.vendor, 22)
+		hostname := truncate(d.hostname, 20)
+		if hostname == "" {
+			hostname = "—"
+		}
+		if vendor == "" {
+			vendor = "—"
+		}
+		left.WriteString(fmt.Sprintf("%s%-15s %-17s %-22s %-20s [%s]\n",
+			marker, d.ip, d.mac, vendor, hostname, policy))
 	}
 	left.WriteString("\n[j/k] move  [s] scan  [q] quit\n")
 
@@ -120,7 +133,15 @@ func (m model) View() string {
 	right.WriteString(headerStyle.Render("Policy"))
 	right.WriteString("\n")
 	if len(m.devices) > 0 {
-		right.WriteString("Target: " + m.devices[m.cursor].ip + "\n\n")
+		d := m.devices[m.cursor]
+		right.WriteString("Target: " + d.ip + " (" + d.mac + ")\n")
+		if d.vendor != "" {
+			right.WriteString("Vendor: " + d.vendor + "\n")
+		}
+		if d.hostname != "" {
+			right.WriteString("Host:   " + d.hostname + "\n")
+		}
+		right.WriteString("\n")
 	}
 	right.WriteString("[d] drop  [t] throttle  [p] pcap  [x] clear\n")
 
@@ -129,6 +150,13 @@ func (m model) View() string {
 		lipgloss.JoinHorizontal(lipgloss.Top, left.String(), "  ", right.String()),
 		bottom,
 	)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
 }
 
 func tail(s []string, n int) []string {
