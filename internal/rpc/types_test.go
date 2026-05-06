@@ -45,3 +45,28 @@ func TestEventEnvelope(t *testing.T) {
 	// Events have no "id" field (notification per JSON-RPC 2.0 §4.1).
 	assert.NotContains(t, string(b), `"id"`)
 }
+
+func TestResponseIDNullWhenNil(t *testing.T) {
+	// JSON-RPC 2.0 §5 requires every response to include the id member,
+	// emitting null when the request id could not be determined. Because
+	// json.RawMessage is []byte, a nil value without `omitempty` serialises
+	// as "id":null. If a future maintainer adds omitempty to Response.ID,
+	// this test fires.
+	r := Response{
+		JSONRPC: "2.0",
+		ID:      nil,
+		Error:   &Error{Code: CodeInternalError, Message: "boom"},
+	}
+	b, err := json.Marshal(r)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), `"id":null`,
+		"Response.ID must not be omitted even when nil (JSON-RPC 2.0 §5)")
+}
+
+func TestRequestNotificationOmitsID(t *testing.T) {
+	notif := Request{JSONRPC: "2.0", Method: "foo"}
+	b, err := json.Marshal(notif)
+	require.NoError(t, err)
+	assert.NotContains(t, string(b), `"id"`,
+		"Request without ID must serialise as a notification (no id key)")
+}
