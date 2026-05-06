@@ -4965,7 +4965,8 @@ func Dial(sockPath string) (*Client, error) {
 	return c, nil
 }
 
-// Events returns a channel of server-pushed events. Closed when Close is called.
+// Events returns a channel of server-pushed events. The channel is closed
+// when the underlying connection is lost (including when Close is called).
 func (c *Client) Events() <-chan Event { return c.events }
 
 // Close terminates the connection.
@@ -4984,6 +4985,12 @@ func (c *Client) Close() error {
 // decodes the response into out (pointer or nil).
 func (c *Client) Call(ctx context.Context, method string, params any, out any) error {
 	c.mu.Lock()
+	// Guard against post-disconnect calls: readLoop sets pending=nil on
+	// connection error; writing to a nil map would panic.
+	if c.pending == nil {
+		c.mu.Unlock()
+		return errors.New("rpc: connection closed")
+	}
 	c.nextID++
 	id := c.nextID
 	ch := make(chan *Response, 1)
