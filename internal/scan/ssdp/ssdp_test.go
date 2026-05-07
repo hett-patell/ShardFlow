@@ -17,6 +17,8 @@ func TestParseSSDPResponseExtractsServer(t *testing.T) {
 		"\r\n"
 	obs, ok := parseSSDPResponse([]byte(resp), net.ParseIP("10.0.0.1"))
 	require.True(t, ok)
-	assert.Contains(t, obs.Vendor, "RouterOS")
+	// SERVER lands in Model so it doesn't clobber the OUI-derived Vendor.
+	assert.Contains(t, obs.Model, "RouterOS")
+	assert.Empty(t, obs.Vendor, "SSDP must not populate Vendor (would clobber OUI)")
 	assert.Equal(t, "10.0.0.1", obs.IP.String())
 }

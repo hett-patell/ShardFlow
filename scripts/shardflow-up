@@ -78,8 +78,11 @@ cleanup() {
     if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
         echo "shardflow-up: shutting daemon down (PID $DAEMON_PID)..."
         kill -TERM "$DAEMON_PID" 2>/dev/null || true
-        # Wait up to 5s for clean shutdown (corrective ARPs take ~1.6s).
-        for _ in $(seq 1 50); do
+        # Up to 10s for clean shutdown. Parallel StopAll runs all
+        # correctives concurrently in ~1.6s regardless of target count;
+        # add slack for nft/tc teardown commands (each capped at 10s
+        # individually but typically <100ms).
+        for _ in $(seq 1 100); do
             kill -0 "$DAEMON_PID" 2>/dev/null || break
             sleep 0.1
         done
@@ -102,8 +105,14 @@ fi
 "$DAEMON" "${DAEMON_ARGS[@]}" >"$LOG_FILE" 2>&1 &
 DAEMON_PID=$!
 
-# Wait for the socket to actually appear AND be reachable.
-for i in $(seq 1 100); do
+# Wait for the socket to actually appear AND be reachable. Daemon startup
+# can include resolveGatewayMAC, which retries every 500ms for up to 8s
+# before giving up — so the readiness budget needs to be at least that
+# (15s), with comfortable slack for nft/tc/preflight on a slow box.
+READY_TIMEOUT_SECS=20
+READY_POLL_INTERVAL_SECS=0.2
+ITERATIONS=$(awk -v t=$READY_TIMEOUT_SECS -v p=$READY_POLL_INTERVAL_SECS 'BEGIN { printf "%d", t / p }')
+for i in $(seq 1 "$ITERATIONS"); do
     if [[ -S "$SOCK" ]] && "$CLIENT" --sock "$SOCK" stats >/dev/null 2>&1; then
         break
     fi
@@ -112,7 +121,7 @@ for i in $(seq 1 100); do
         tail -20 "$LOG_FILE" >&2
         exit 1
     fi
-    sleep 0.1
+    sleep "$READY_POLL_INTERVAL_SECS"
 done
 
 if ! "$CLIENT" --sock "$SOCK" stats >/dev/null 2>&1; then

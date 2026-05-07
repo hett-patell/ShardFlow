@@ -11,11 +11,20 @@ import (
 )
 
 // Device is the public record for a host we have observed.
+//
+// Vendor and Model are deliberately separate. Vendor is the IEEE OUI
+// vendor of the MAC's manufacturer (always the silicon maker — Apple,
+// Samsung, Intel). Model is the SSDP/UPnP server string ("Linux/3.10
+// UPnP/1.0 SSDP/1.6 PhilipsHue/1.0") which describes the firmware /
+// device kind. Conflating them — as the v1 SSDP scanner did — would
+// overwrite the OUI lookup every time a device announced itself, hiding
+// the manufacturer from the operator.
 type Device struct {
 	MAC      net.HardwareAddr
 	IP       net.IP
 	Hostname string
 	Vendor   string
+	Model    string
 	LastSeen time.Time
 	// Policy is set by policycompiler; nil means "no policy".
 	Policy any // typed by callers; the store doesn't interpret it
@@ -28,6 +37,7 @@ type Observation struct {
 	IP       net.IP
 	Hostname string
 	Vendor   string
+	Model    string
 	Seen     time.Time
 }
 
@@ -37,6 +47,7 @@ type EventKind int
 const (
 	EventDiscovered EventKind = iota
 	EventUpdated
+	EventEvicted // device removed by TTL sweep; sent to subscribers so UIs can drop the row
 )
 
 // Event is what subscribers receive.
@@ -46,16 +57,28 @@ type Event struct {
 }
 
 // Store is the device map. Safe for concurrent use.
+//
+// Indexes:
+//   - byMAC: canonical map (MAC string → *Device)
+//   - byIP:  reverse index (IP string → MAC string), kept in sync with
+//     byMAC[mac].IP. ResolveIP used to be O(N) over byMAC; on a busy
+//     LAN with hundreds of devices, called from every Policy.Set/Clear
+//     handler, that scan was a real cost. byIP makes it O(1).
 type Store struct {
 	mu     sync.RWMutex
 	byMAC  map[string]*Device
+	byIP   map[string]string
 	subsMu sync.Mutex
 	subs   map[chan Event]struct{}
 }
 
 // New returns an empty store.
 func New() *Store {
-	return &Store{byMAC: make(map[string]*Device), subs: map[chan Event]struct{}{}}
+	return &Store{
+		byMAC: make(map[string]*Device),
+		byIP:  make(map[string]string),
+		subs:  map[chan Event]struct{}{},
+	}
 }
 
 // copyDevice returns a deep copy of d so callers can't mutate store-internal
@@ -98,13 +121,23 @@ func (s *Store) Upsert(o Observation) {
 		s.byMAC[key] = d
 	}
 	if o.IP != nil {
+		// Keep byIP in sync: drop the old reverse entry, install the new.
+		// Two MACs claiming the same IP can happen on misconfigured LANs;
+		// last writer wins, matching the byMAC behaviour above.
+		if existed && d.IP != nil {
+			delete(s.byIP, d.IP.String())
+		}
 		d.IP = append(net.IP{}, o.IP...)
+		s.byIP[d.IP.String()] = key
 	}
 	if o.Hostname != "" {
 		d.Hostname = o.Hostname
 	}
 	if o.Vendor != "" {
 		d.Vendor = o.Vendor
+	}
+	if o.Model != "" {
+		d.Model = o.Model
 	}
 	if !o.Seen.IsZero() {
 		d.LastSeen = o.Seen
@@ -131,16 +164,20 @@ func (s *Store) Get(m net.HardwareAddr) (Device, bool) {
 }
 
 // ResolveIP looks up the MAC currently associated with the given IP.
-// Returns (mac, true) on hit, (nil, false) on miss.
+// O(1) via the byIP reverse index. Returns (mac, true) on hit, (nil, false)
+// on miss.
 func (s *Store) ResolveIP(ip net.IP) (net.HardwareAddr, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, d := range s.byMAC {
-		if d.IP.Equal(ip) {
-			return append(net.HardwareAddr{}, d.MAC...), true
-		}
+	macKey, ok := s.byIP[ip.String()]
+	if !ok {
+		return nil, false
 	}
-	return nil, false
+	d, ok := s.byMAC[macKey]
+	if !ok {
+		return nil, false
+	}
+	return append(net.HardwareAddr{}, d.MAC...), true
 }
 
 // List returns a snapshot of all known devices, sorted by IP for stable output.
@@ -159,26 +196,32 @@ func (s *Store) List() []Device {
 
 // SetPolicy updates the typed-as-any policy field for a known MAC.
 // Returns false if the MAC is unknown.
+//
+// Earlier versions spawned a goroutine for each broadcast (`go
+// s.broadcast(...)`) to avoid holding s.mu across subscriber sends.
+// That created an unbounded goroutine spawn rate under sustained
+// policy churn. broadcast itself uses non-blocking sends per
+// subscriber (trySend), so calling it inline can never block on a
+// slow consumer — we just need to release s.mu before taking
+// s.subsMu.
 func (s *Store) SetPolicy(m net.HardwareAddr, p any) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	d, ok := s.byMAC[m.String()]
 	if !ok {
+		s.mu.Unlock()
 		return false
 	}
 	d.Policy = p
 	snapshot := copyDevice(*d)
-	go s.broadcast(Event{Kind: EventUpdated, Device: snapshot})
+	s.mu.Unlock()
+	s.broadcast(Event{Kind: EventUpdated, Device: snapshot})
 	return true
 }
 
 // Subscribe returns a channel that receives every event. Buffer size 64.
 // When a slow consumer's buffer fills, the newest incoming event is
-// dropped (the existing buffered events stay queued). Caller MUST call
-// Unsubscribe with the returned channel when done — the channel is
-// bidirectional only because Unsubscribe needs to close it; callers must
-// not close it themselves (broadcast will recover, but the subscriber
-// then silently stops receiving).
+// dropped. Caller MUST call Unsubscribe with the returned channel when
+// done.
 func (s *Store) Subscribe() chan Event {
 	ch := make(chan Event, 64)
 	s.subsMu.Lock()
@@ -205,4 +248,41 @@ func (s *Store) broadcast(e Event) {
 	for ch := range s.subs {
 		trySend(ch, e)
 	}
+}
+
+// Evict removes every device whose LastSeen is older than now-ttl. A
+// device with an active policy is preserved regardless of ttl: the
+// poison/throttle/pcap path holds the canonical reference and we don't
+// want to silently drop a target the operator is actively manipulating.
+// Returns the number of devices evicted.
+//
+// Intended to be called periodically (e.g. once a minute) by the daemon
+// so the device map doesn't grow unbounded on long-running sessions —
+// roaming guests with privacy-randomised MACs, IoT devices that come and
+// go, etc.
+func (s *Store) Evict(now time.Time, ttl time.Duration) int {
+	if ttl <= 0 {
+		return 0
+	}
+	cutoff := now.Add(-ttl)
+	s.mu.Lock()
+	var evicted []Device
+	for k, d := range s.byMAC {
+		if d.Policy != nil {
+			continue
+		}
+		if d.LastSeen.IsZero() || d.LastSeen.After(cutoff) {
+			continue
+		}
+		if d.IP != nil {
+			delete(s.byIP, d.IP.String())
+		}
+		delete(s.byMAC, k)
+		evicted = append(evicted, copyDevice(*d))
+	}
+	s.mu.Unlock()
+	for _, d := range evicted {
+		s.broadcast(Event{Kind: EventEvicted, Device: d})
+	}
+	return len(evicted)
 }

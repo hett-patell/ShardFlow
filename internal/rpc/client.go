@@ -7,7 +7,14 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 )
+
+// clientEventBuffer is the demuxed event channel size. Sized for a
+// discovery burst (a /24 scan can push ~250 device.discovered events
+// back-to-back). Slow consumers still drop events past this point, but
+// Dropped() makes the loss visible.
+const clientEventBuffer = 512
 
 // Client is a JSON-RPC 2.0 client that demuxes responses from server-pushed events.
 type Client struct {
@@ -20,6 +27,11 @@ type Client struct {
 	pending map[int]chan *Response
 	events  chan Event
 	closed  bool
+
+	// dropped counts events the readLoop discarded because events was
+	// full (consumer too slow). Exposed via Dropped() so the TUI/CLI
+	// can surface the loss instead of silently missing updates.
+	dropped atomic.Uint64
 }
 
 // Dial connects to a daemon at sockPath.
@@ -32,7 +44,7 @@ func Dial(sockPath string) (*Client, error) {
 		conn:    conn,
 		br:      bufio.NewReader(conn),
 		pending: map[int]chan *Response{},
-		events:  make(chan Event, 64),
+		events:  make(chan Event, clientEventBuffer),
 	}
 	go c.readLoop()
 	return c, nil
@@ -41,6 +53,11 @@ func Dial(sockPath string) (*Client, error) {
 // Events returns a channel of server-pushed events. The channel is closed
 // when the underlying connection is lost (including when Close is called).
 func (c *Client) Events() <-chan Event { return c.events }
+
+// Dropped returns the cumulative count of events the client had to discard
+// because the consumer wasn't draining Events() fast enough. Monotonically
+// increasing; non-zero values indicate the UI is missing state updates.
+func (c *Client) Dropped() uint64 { return c.dropped.Load() }
 
 // Close terminates the connection.
 func (c *Client) Close() error {
@@ -155,6 +172,7 @@ func (c *Client) readLoop() {
 				select {
 				case c.events <- ev:
 				default:
+					c.dropped.Add(1)
 				}
 			}
 		}

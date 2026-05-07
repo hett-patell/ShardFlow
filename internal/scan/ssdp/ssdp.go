@@ -85,9 +85,12 @@ func parseSSDPResponse(b []byte, ip net.IP) (devicestore.Observation, bool) {
 	if server == "" {
 		return devicestore.Observation{}, false
 	}
+	// SERVER goes into Model — it describes firmware/device-kind, not the
+	// MAC's silicon vendor. Storing it as Vendor would clobber the OUI
+	// lookup every time a device announced itself.
 	return devicestore.Observation{
-		IP:     append(net.IP{}, ip...),
-		Vendor: server,
-		Seen:   time.Now(),
+		IP:    append(net.IP{}, ip...),
+		Model: server,
+		Seen:  time.Now(),
 	}, true
 }

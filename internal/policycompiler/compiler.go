@@ -21,7 +21,8 @@ type Compiler struct {
 
 	mu       sync.RWMutex
 	current  map[string]Spec   // key: MAC.String()
-	markOf   map[string]uint32 // key: MAC.String() — deterministic per-target fwmark
+	markOf   map[string]uint32 // key: MAC.String() — fwmark currently in use
+	freeMarks []uint32         // marks released by teardown, reused before allocating new
 	nextMark uint32
 }
 
@@ -38,13 +39,33 @@ func New(nft NFT, tc TC, pcap Pcap, arp ARP, realIface string) *Compiler {
 }
 
 // markFor returns the stable fwmark for mac, allocating one on first use.
+// Reuses marks released by tearDownOne so a long-running daemon that has
+// applied/cleared 32k+ policies doesn't run out of usable tc-filter prios
+// (prios pack into uint16 via mark&0x7FFF).
 func (c *Compiler) markFor(mac string) uint32 {
 	if m, ok := c.markOf[mac]; ok {
+		return m
+	}
+	if n := len(c.freeMarks); n > 0 {
+		m := c.freeMarks[n-1]
+		c.freeMarks = c.freeMarks[:n-1]
+		c.markOf[mac] = m
 		return m
 	}
 	c.nextMark++
 	c.markOf[mac] = c.nextMark
 	return c.nextMark
+}
+
+// releaseMark returns mark's slot to the free pool so a future markFor
+// can reuse it. Called only after a successful teardown — releasing on
+// failed teardown would risk reusing a mark that still has live kernel
+// state attached to it.
+func (c *Compiler) releaseMark(mac string) {
+	if m, ok := c.markOf[mac]; ok {
+		delete(c.markOf, mac)
+		c.freeMarks = append(c.freeMarks, m)
+	}
 }
 
 // Apply moves the system to desired.
@@ -82,6 +103,14 @@ func (c *Compiler) Apply(ctx context.Context, desired map[string]Spec) error {
 				continue
 			}
 			delete(c.current, mac)
+			// Only release the mark when the target is fully going
+			// away (no replacement in desired). When we're tearing
+			// down to bring up a new policy on the same MAC, keep
+			// the mark stable so the new bringup doesn't trigger a
+			// prio reshuffle in tc.
+			if !ok {
+				c.releaseMark(mac)
+			}
 		}
 	}
 	// Phase 2: bring up (strict per-target — partial failures roll back).

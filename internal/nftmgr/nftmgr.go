@@ -10,7 +10,24 @@ import (
 	"net"
 	"os/exec"
 	"strings"
+	"time"
 )
+
+// cmdTimeout caps every nft invocation so a wedged kernel transaction
+// (rare but possible under heavy contention) cannot hang the policy
+// compiler — which would block every Policy.Set/Clear handler waiting
+// on the same mutex. 10s is generous for real nft transactions while
+// short enough that an operator notices the failure and can react.
+const cmdTimeout = 10 * time.Second
+
+// withTimeout returns a derived context bounded by cmdTimeout, plus its
+// cancel func. If parent already has a tighter deadline we leave it.
+func withTimeout(parent context.Context) (context.Context, context.CancelFunc) {
+	if dl, ok := parent.Deadline(); ok && time.Until(dl) < cmdTimeout {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, cmdTimeout)
+}
 
 // Runner runs a nft(8) command. Tests substitute a fake.
 type Runner interface {
@@ -25,7 +42,9 @@ type Runner interface {
 type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, args []string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "nft", args...)
+	tCtx, cancel := withTimeout(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(tCtx, "nft", args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -36,7 +55,9 @@ func (execRunner) Run(ctx context.Context, args []string) ([]byte, error) {
 }
 
 func (execRunner) RunScript(ctx context.Context, script string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
+	tCtx, cancel := withTimeout(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(tCtx, "nft", "-f", "-")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out

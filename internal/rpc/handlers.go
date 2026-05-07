@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -38,6 +39,13 @@ type HandlerDeps struct {
 	// also empty the handler rejects the request with InvalidParams.
 	DefaultPcapDir string
 
+	// Session returns the operator's current connection state (iface,
+	// gateway, WiFi association, scan diagnostics). Provided as a
+	// callback rather than a snapshot field so the daemon can update
+	// scan counters/poison counts without re-wiring deps. Optional —
+	// handlers tolerate Session==nil and respond with an empty DTO.
+	Session func() SessionDTO
+
 	// applyMu serialises the snapshot→modify→Apply sequence in setPolicy
 	// and clearPolicy so concurrent handler invocations can't clobber each
 	// other with stale snapshots. Compiler.Apply has its own mutex, but
@@ -51,7 +59,25 @@ type HandlerDeps struct {
 	// daemon exit; a setPolicy that lands between Apply(empty) and
 	// arp.StopAll would otherwise leave the new target uncorrected.
 	shuttingDown bool
+
+	// scanMu is held while a Scanner is in flight. Now that the RPC server
+	// dispatches each request in its own goroutine, a misbehaving (or
+	// retry-happy) client could fan out concurrent Scan requests; the
+	// underlying scanner opens a pcap handle and floods the LAN with
+	// ARP, so running two in parallel doubles the RF/CPU load for no
+	// gain. We TryLock here and reject overlapping requests with a clear
+	// error rather than queue them.
+	scanMu sync.Mutex
 }
+
+// scanHardTimeout is the absolute upper bound on a single Scan. Internally
+// the scanner already gives each phase its own ctx deadline (5s active
+// sweep, 3s per multicast probe) so this is a safety net for pathological
+// cases — kernel TX backpressure on a contended Wi-Fi link can push a
+// /16 sweep past its phase deadline because each WritePacketData blocks
+// for tens of milliseconds. Without an outer cap one Scan call could
+// otherwise run for minutes and the TUI would freeze on c.Call.
+const scanHardTimeout = 15 * time.Second
 
 // MarkShuttingDown blocks new Policy.Set/Policy.Clear handler invocations.
 // Called from the daemon's signal handler before tearing down state.
@@ -66,16 +92,27 @@ func (d *HandlerDeps) MarkShuttingDown() {
 func BuildHandlers(d *HandlerDeps) map[string]Handler {
 	return map[string]Handler{
 		MethodScan: func(ctx context.Context, _ json.RawMessage) (any, *Error) {
-			if err := d.Scanner(ctx); err != nil {
+			if !d.scanMu.TryLock() {
+				return nil, &Error{Code: CodeInternalError, Message: "scan already in progress"}
+			}
+			defer d.scanMu.Unlock()
+			sCtx, cancel := context.WithTimeout(ctx, scanHardTimeout)
+			defer cancel()
+			if err := d.Scanner(sCtx); err != nil {
 				return nil, &Error{Code: CodeInternalError, Message: err.Error()}
 			}
 			return map[string]string{"status": "ok"}, nil
 		},
 		MethodDevicesList: func(_ context.Context, _ json.RawMessage) (any, *Error) {
 			devs := d.Store.List()
+			snap := d.Compiler.Snapshot()
 			out := make([]DeviceDTO, 0, len(devs))
 			for _, dev := range devs {
-				out = append(out, deviceToDTO(dev))
+				dto := deviceToDTO(dev)
+				if s, ok := snap[dev.MAC.String()]; ok {
+					dto.Policy = formatPolicy(s)
+				}
+				out = append(out, dto)
 			}
 			return out, nil
 		},
@@ -94,7 +131,11 @@ func BuildHandlers(d *HandlerDeps) map[string]Handler {
 			if !ok {
 				return nil, &Error{Code: CodeUnknownTarget, Message: "no such device"}
 			}
-			return deviceToDTO(dev), nil
+			dto := deviceToDTO(dev)
+			if s, ok := d.Compiler.Snapshot()[mac.String()]; ok {
+				dto.Policy = formatPolicy(s)
+			}
+			return dto, nil
 		},
 		MethodPolicySet: func(ctx context.Context, params json.RawMessage) (any, *Error) {
 			var p PolicySpec
@@ -131,6 +172,12 @@ func BuildHandlers(d *HandlerDeps) map[string]Handler {
 				"policies": len(d.Compiler.Snapshot()),
 				"poisoned": d.ActivePoisons(),
 			}, nil
+		},
+		MethodSessionGet: func(_ context.Context, _ json.RawMessage) (any, *Error) {
+			if d.Session == nil {
+				return SessionDTO{}, nil
+			}
+			return d.Session(), nil
 		},
 	}
 }
@@ -265,6 +312,35 @@ func deviceToDTO(dev devicestore.Device) DeviceDTO {
 		IP:       dev.IP.String(),
 		Hostname: dev.Hostname,
 		Vendor:   dev.Vendor,
+		Model:    dev.Model,
 		LastSeen: dev.LastSeen.Format(time.RFC3339),
 	}
+}
+
+// formatPolicy renders a compiler Spec into a short human-readable form
+// for the Policy column in DeviceDTO. Matches what the TUI and the CLI
+// `devices list` table expect: "drop" / "throttle 200kbit" / "pcap".
+func formatPolicy(s policycompiler.Spec) string {
+	switch s.Kind {
+	case policycompiler.KindDrop:
+		return "drop"
+	case policycompiler.KindThrottle:
+		if s.RateKbit > 0 {
+			return "throttle " + formatKbit(s.RateKbit)
+		}
+		return "throttle"
+	case policycompiler.KindPcap:
+		return "pcap"
+	}
+	return ""
+}
+
+// formatKbit renders kbit as either "Nkbit" or "Nmbit" using the
+// networking-SI convention (1 mbit = 1000 kbit) that matches the rest
+// of the CLI's parseRate.
+func formatKbit(k int) string {
+	if k >= 1000 && k%1000 == 0 {
+		return fmt.Sprintf("%dmbit", k/1000)
+	}
+	return fmt.Sprintf("%dkbit", k)
 }

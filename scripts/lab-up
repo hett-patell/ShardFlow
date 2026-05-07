@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# lab-up — spin up N fake hosts on a Linux bridge for offline scan testing.
+#
+# Why this exists
+# ---------------
+# When you don't have a populated LAN at hand (or you're on a guest Wi-Fi
+# with AP isolation hiding every other client), shardflow has nothing to
+# scan. This script creates a private /24, attaches N network namespaces
+# to it via veth pairs, and lets you point the daemon at the bridge:
+#
+#   sudo ./scripts/lab-up 16
+#   sudo ./bin/shardflowd -i sf-lab0 -sock /tmp/sf-lab.sock --force --clean-on-start
+#   ./bin/shardflow --sock /tmp/sf-lab.sock tui   # press S
+#
+# You should see all N hosts (plus the bridge gateway) discovered by the
+# active ARP sweep, because the kernel auto-replies to ARP requests for
+# every assigned IP — no userspace responder needed.
+#
+# Hostname/vendor enrichment is intentionally out of scope here; the OUI
+# DB will report "Locally administered (private)" for the synthetic MACs
+# and hostnames will be blank. That's fine: the goal is to confirm the
+# *scanner* is working, not the enrichment pipeline. For richer testing
+# extend each netns with avahi-publish-address or similar.
+#
+# Idempotent: rerunning with a different N tears the previous rig down
+# first. Use lab-down to dispose entirely.
+set -euo pipefail
+
+COUNT="${1:-12}"
+BRIDGE="${SF_LAB_BRIDGE:-sf-lab0}"
+SUBNET_PREFIX="${SF_LAB_PREFIX:-10.99.42}"
+# We give the host (operator) the .1 IP on the bridge — that's the
+# address shardflowd will see as its own. .10 is then the synthetic
+# "gateway" host that satisfies the daemon's default-route requirement
+# (see GATEWAY_HOST_IP below). Subsequent fake clients live at .11, .12,
+# ... up to .10 + COUNT - 1.
+GATEWAY_IP="${SUBNET_PREFIX}.1"
+HOST_BASE_IP=10
+NS_PREFIX="sf-lab-h"
+
+if (( COUNT < 1 || COUNT > 240 )); then
+    echo "lab-up: count must be between 1 and 240 (got $COUNT)" >&2
+    exit 2
+fi
+
+if [[ "$EUID" -ne 0 ]]; then
+    echo "lab-up: must run as root (try: sudo $0 $COUNT)" >&2
+    exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+DOWN_SCRIPT="$SCRIPT_DIR/lab-down"
+
+# Tear down any previous rig first. lab-down is idempotent so this is safe
+# even on a clean machine.
+if [[ -x "$DOWN_SCRIPT" ]]; then
+    "$DOWN_SCRIPT" >/dev/null 2>&1 || true
+fi
+
+echo "lab-up: creating bridge $BRIDGE with $COUNT hosts in $SUBNET_PREFIX.0/24"
+
+# Bridge: created on the host (NOT in a netns) so the daemon, running on
+# the host, can bind to it directly. The bridge gets the gateway IP so
+# the netns hosts have a default route to "out" and the operator-side
+# arping/ping checks behave like a real /24.
+ip link add "$BRIDGE" type bridge
+ip addr add "$GATEWAY_IP/24" dev "$BRIDGE"
+ip link set "$BRIDGE" up
+
+# Bridges drop forwarded frames by default if br_netfilter+iptables
+# REJECT FORWARD is in effect. We only need intra-bridge L2 here, so
+# explicitly disable the netfilter hook for our bridge to avoid surprise
+# drops on hosts where iptables-nft has a default-DROP FORWARD chain.
+if [[ -e /proc/sys/net/bridge/bridge-nf-call-iptables ]]; then
+    echo 0 > /proc/sys/net/bridge/bridge-nf-call-iptables
+fi
+
+# Track what we created so lab-down can roll it back precisely.
+STATE_DIR=/run/sf-lab
+mkdir -p "$STATE_DIR"
+cat > "$STATE_DIR/rig.env" <<EOF
+BRIDGE=$BRIDGE
+SUBNET_PREFIX=$SUBNET_PREFIX
+GATEWAY_IP=$GATEWAY_IP
+COUNT=$COUNT
+NS_PREFIX=$NS_PREFIX
+EOF
+
+# The first synthetic host doubles as the "gateway" for shardflowd's
+# benefit. The daemon insists on a non-nil IPv4 default-route gateway
+# at startup (see iface.Lookup → defaultGateway) because it needs the
+# (gw IP, gw MAC) tuple to issue corrective ARPs after a poison. On a
+# real LAN that's the upstream router; in the lab we just promote the
+# first netns host so the daemon has something coherent to resolve.
+GATEWAY_HOST_IP="${SUBNET_PREFIX}.${HOST_BASE_IP}"
+
+for i in $(seq 1 "$COUNT"); do
+    NS="${NS_PREFIX}${i}"
+    HOST_IP="${SUBNET_PREFIX}.$((HOST_BASE_IP + i - 1))"
+    # Locally-administered MAC: bit 0x02 of the first byte. Last byte is
+    # the host index so addresses are stable across rig recreations
+    # (helps when correlating logs to specific fake hosts).
+    MAC=$(printf '02:99:42:00:00:%02x' "$i")
+    OUTER="sf-veth$i"
+    INNER="eth0"
+
+    ip netns add "$NS"
+    ip link add "$OUTER" type veth peer name "$INNER"
+    ip link set "$INNER" netns "$NS"
+    ip link set "$OUTER" master "$BRIDGE"
+    ip link set "$OUTER" up
+
+    ip -n "$NS" link set "$INNER" address "$MAC"
+    ip -n "$NS" addr add "$HOST_IP/24" dev "$INNER"
+    ip -n "$NS" link set lo up
+    ip -n "$NS" link set "$INNER" up
+    ip -n "$NS" route add default via "$GATEWAY_IP"
+done
+
+# Install a default route on the host scoped to $BRIDGE pointing at
+# $GATEWAY_HOST_IP, so shardflowd's iface.Lookup → defaultGateway sees
+# a coherent gateway. metric 9999 keeps it well below the host's real
+# default route (typical metric 100..600), so this never steals real
+# outbound traffic — it only exists to make `ip -4 route show default
+# dev $BRIDGE` non-empty.
+ip -4 route replace default via "$GATEWAY_HOST_IP" dev "$BRIDGE" metric 9999 || true
+
+echo "lab-up: rig ready"
+echo "  bridge:   $BRIDGE  (host IP $GATEWAY_IP/24)"
+echo "  gateway:  $GATEWAY_HOST_IP   (= the first fake host; satisfies the daemon's gw check)"
+echo "  hosts:    $COUNT in ${SUBNET_PREFIX}.${HOST_BASE_IP}..${SUBNET_PREFIX}.$((HOST_BASE_IP + COUNT - 1))"
+echo
+echo "next:"
+echo "  sudo ./bin/shardflowd -i $BRIDGE -sock /tmp/sf-lab.sock --force --clean-on-start \\"
+echo "    -default-pcap-dir /tmp/sf-lab-pcap &"
+echo "  ./bin/shardflow --sock /tmp/sf-lab.sock tui   # press S to scan"
+echo
+echo "  (or: sudo ./scripts/shardflow-up -i $BRIDGE -s /tmp/sf-lab.sock)"

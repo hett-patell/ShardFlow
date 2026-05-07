@@ -72,6 +72,13 @@ func argvDelFilterByPrio(iface string, prio uint32) []string {
 		"protocol", "all", "prio", strconv.FormatUint(uint64(prio), 10)}
 }
 
+// Delete the ingress qdisc on the real iface. Removes every filter that
+// was ever attached to it, so callers must clear per-target filters first
+// only if they need to inspect them.
+func argvDelIngressQdisc(iface string) []string {
+	return []string{"qdisc", "del", "dev", iface, "ingress"}
+}
+
 // Flower classifier on the IFB qdisc that directs frames matching src_mac
 // into a specific HTB class. `classid <id>` is the classifier directive
 // (no `action ok` — that would treat this as an action chain rather than

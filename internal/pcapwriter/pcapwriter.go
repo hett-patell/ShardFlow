@@ -78,6 +78,18 @@ func (m *Manager) Open(mac, ipStr, srcIface, dir string, maxBytes int64, maxAge 
 	startup := make(chan error, 1)
 	go func() {
 		defer close(w.finished)
+		// Recover panics from libpcap or pcapgo (rare but possible
+		// under unusual link types or kernel-version skew). Without
+		// this, a panic before runWriter sends on `startup` would
+		// leave Open blocked forever waiting on the channel.
+		defer func() {
+			if r := recover(); r != nil {
+				select {
+				case startup <- fmt.Errorf("pcapwriter panic: %v", r):
+				default:
+				}
+			}
+		}()
 		_ = runWriter(ctx, mac, ipStr, srcIface, dir, maxBytes, maxAge, startup)
 	}()
 	if err := <-startup; err != nil {

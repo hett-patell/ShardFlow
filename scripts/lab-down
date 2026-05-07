@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# lab-down — dispose the rig that lab-up created. Idempotent.
+set -euo pipefail
+
+BRIDGE="${SF_LAB_BRIDGE:-sf-lab0}"
+NS_PREFIX="${SF_LAB_NS_PREFIX:-sf-lab-h}"
+STATE_DIR=/run/sf-lab
+
+if [[ "$EUID" -ne 0 ]]; then
+    echo "lab-down: must run as root (try: sudo $0)" >&2
+    exit 1
+fi
+
+# Prefer the recorded values from lab-up state so a custom prefix/bridge
+# is honoured. Fall back to env/defaults if state is missing (e.g. user
+# wiped /run).
+if [[ -f "$STATE_DIR/rig.env" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_DIR/rig.env"
+fi
+
+# Delete every netns that matches the prefix. Tolerant of partial rigs.
+mapfile -t NS_LIST < <(ip netns list 2>/dev/null | awk '{print $1}' | grep -E "^${NS_PREFIX}[0-9]+$" || true)
+for ns in "${NS_LIST[@]}"; do
+    ip netns del "$ns" 2>/dev/null || true
+done
+
+# Also clean up any orphaned host-side veth peers that survived a netns
+# delete (rare, but happens if the kernel was out of memory mid-create).
+mapfile -t VETH_LIST < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk -F'@' '{print $1}' | grep -E '^sf-veth[0-9]+$' || true)
+for v in "${VETH_LIST[@]}"; do
+    ip link del "$v" 2>/dev/null || true
+done
+
+# Remove the high-metric default route we installed on the bridge so it
+# doesn't linger if anything else (NM, dhclient, etc.) trips over a
+# stale route to a now-deleted iface. Tolerant of "no such route".
+if [[ -n "${SUBNET_PREFIX:-}" ]]; then
+    ip -4 route del default via "${SUBNET_PREFIX}.10" dev "$BRIDGE" metric 9999 2>/dev/null || true
+fi
+
+if ip link show "$BRIDGE" >/dev/null 2>&1; then
+    ip link del "$BRIDGE"
+fi
+
+rm -f "$STATE_DIR/rig.env"
+rmdir "$STATE_DIR" 2>/dev/null || true
+
+echo "lab-down: cleaned up bridge $BRIDGE and namespaces matching ${NS_PREFIX}*"

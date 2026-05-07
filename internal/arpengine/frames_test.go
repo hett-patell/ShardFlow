@@ -34,7 +34,13 @@ func TestBuildPoisonReply(t *testing.T) {
 
 func TestStopAllUnknownTargetsIsNil(t *testing.T) {
 	// StopAll on an empty engine returns nil (no errors to aggregate).
+	// New requires a working pcap iface; lo is always present and works
+	// for OpenLive even though we never actually transmit anything here.
 	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:01")
-	e := New("lo", mac, time.Millisecond)
+	e, err := New("lo", mac, time.Millisecond)
+	if err != nil {
+		t.Skipf("pcap.OpenLive(lo) failed (likely missing CAP_NET_RAW in test env): %v", err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
 	require.NoError(t, e.StopAll())
 }

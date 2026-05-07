@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +9,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/hett-patell/ShardFlow/internal/rpc"
 )
 
 func TestScanningStateShowsInStatusBar(t *testing.T) {
@@ -17,7 +20,7 @@ func TestScanningStateShowsInStatusBar(t *testing.T) {
 	m.scanStarted = time.Now().Add(-2 * time.Second)
 	view := m.View()
 	visible := stripANSI(view)
-	assert.Contains(t, visible, "SCANNING…", "scanning state must show in status bar")
+	assert.Contains(t, visible, "scanning", "scanning state must show in status bar")
 	assert.Contains(t, visible, "(2s)", "elapsed seconds must show")
 }
 
@@ -36,22 +39,114 @@ func TestModelMovesSelectionDownUp(t *testing.T) {
 	assert.Equal(t, 0, m.cursor)
 }
 
+func TestFilterMatchesIPAndHostname(t *testing.T) {
+	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
+	m.devices = []deviceRow{
+		{ip: "10.0.0.1", hostname: "router.local"},
+		{ip: "10.0.0.42", hostname: "het-laptop.local"},
+		{ip: "10.0.0.55", hostname: "phone.local"},
+	}
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	assert.True(t, m.filterMode)
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("laptop")})
+	vis := m.visibleDevices()
+	if assert.Len(t, vis, 1) {
+		assert.Equal(t, "het-laptop.local", vis[0].hostname)
+	}
+}
+
+func TestEscClearsFilter(t *testing.T) {
+	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
+	m.devices = []deviceRow{{ip: "10.0.0.1"}, {ip: "10.0.0.42"}}
+	m.filter = "10.0.0.42"
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyEsc})
+	assert.Equal(t, "", m.filter)
+	assert.Len(t, m.visibleDevices(), 2)
+}
+
+func TestHelpToggle(t *testing.T) {
+	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
+	m.width, m.height = 140, 60
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	assert.True(t, m.showHelp)
+	visible := stripANSI(m.View())
+	assert.Contains(t, visible, "HELP", "help panel must render after [?]")
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	assert.False(t, m.showHelp)
+}
+
+func TestArrowKeysMoveCursor(t *testing.T) {
+	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
+	m.devices = []deviceRow{{ip: "10.0.0.1"}, {ip: "10.0.0.2"}, {ip: "10.0.0.3"}}
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyDown})
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyDown})
+	assert.Equal(t, 2, m.cursor)
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyHome})
+	assert.Equal(t, 0, m.cursor)
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyEnd})
+	assert.Equal(t, 2, m.cursor)
+}
+
+func TestPolicyKeysActOnFilteredCursor(t *testing.T) {
+	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
+	m.client = nil // applyPolicyCmd captures m.client; we just need it not to panic on creation
+	m.devices = []deviceRow{
+		{ip: "10.0.0.1", hostname: "router.local"},
+		{ip: "10.0.0.42", hostname: "het-laptop.local"},
+	}
+	m.filter = "router"
+	// cursor starts at 0; with filter, that maps to the first matching
+	// row in visibleDevices(). Press D — applyPolicyCmd captures
+	// vis[m.cursor].ip, which must be the filtered row, not m.devices[0].
+	// We can't easily inspect the closure's captured target without
+	// running the command, so just assert cursor stays valid for the
+	// filtered list.
+	vis := m.visibleDevices()
+	assert.Len(t, vis, 1)
+	assert.Equal(t, "10.0.0.1", vis[0].ip)
+	_, cmd := m.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	assert.NotNil(t, cmd, "D on a non-empty filtered list must produce an applyPolicy cmd")
+}
+
+func TestViewportScrollsForLongList(t *testing.T) {
+	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
+	m.width, m.height = 140, 30 // small height -> tight viewport
+	for i := 0; i < 50; i++ {
+		m.devices = append(m.devices, deviceRow{ip: fmt.Sprintf("10.0.0.%d", i+1)})
+	}
+	// PageDown a couple times — viewportOffset should advance.
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyPgDown})
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyPgDown})
+	assert.Greater(t, m.viewportOffset, 0, "viewport must scroll on PgDn")
+	// End jumps to last row; viewport must include cursor.
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyEnd})
+	assert.Equal(t, 49, m.cursor)
+	height := m.devicesViewportHeight()
+	assert.GreaterOrEqual(t, m.cursor, m.viewportOffset)
+	assert.Less(t, m.cursor, m.viewportOffset+height)
+}
+
 func TestRenderedViewFitsTerminalWidth(t *testing.T) {
 	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
-	m.width, m.height = 220, 50
+	m.width, m.height = 250, 50
 	m.devices = []deviceRow{
 		{ip: "192.168.1.1", mac: "08:63:32:60:3f:63", vendor: "IEEE Reg. Authority", hostname: "router.local", policy: ""},
 		{ip: "192.168.1.6", mac: "22:53:a5:32:06:6b", vendor: "", hostname: "", policy: "drop"},
 		{ip: "192.168.1.10", mac: "e4:0d:36:92:84:57", vendor: "Intel Corporate", hostname: "het-laptop.local", policy: "throttle 200kbit"},
 	}
+	m.session = rpc.SessionDTO{
+		Iface: "wlan0", IP: "192.168.1.42", CIDR: "192.168.1.42/24",
+		Gateway: "192.168.1.1", GwMAC: "08:63:32:60:3f:63",
+		Wireless: true, SSID: "HomeWiFi-5G", BSSID: "08:63:32:60:3f:63",
+		SignalDBm: -52, TxRateMbit: 130.0, FreqMHz: 5180,
+	}
 	view := m.View()
 	t.Logf("\n%s\n", view)
-	// Check no line exceeds 130 cols (visible width — strip ANSI for the test).
+	// Dashboard now caps at maxRenderWidth (200) regardless of terminal width.
 	for i, line := range strings.Split(view, "\n") {
 		visible := stripANSI(line)
-		// Dashboard caps at maxRenderWidth (140) regardless of terminal width.
-		if w := lipgloss.Width(visible); w > 145 {
-			t.Errorf("line %d width %d exceeds 145 (cap is 140): %q", i, w, visible)
+		if w := lipgloss.Width(visible); w > 205 {
+			t.Errorf("line %d width %d exceeds 205 (cap is 200): %q", i, w, visible)
 		}
 	}
 }

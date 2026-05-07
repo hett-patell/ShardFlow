@@ -38,24 +38,25 @@ type Spec struct {
 
 // Effectors
 
+// NFT and TC interfaces are deliberately scoped to what the compiler
+// actually calls: per-target rule add/clear. Daemon-lifecycle methods
+// (EnsureTables, EnsureIFB, EnsureRedirect, Teardown) are concrete
+// methods on the *Manager structs in nftmgr/tcmgr and called directly
+// from the daemon main, not via these interfaces. Keeping the interface
+// thin makes the compiler trivially mockable and prevents the test
+// stubs from drifting when daemon-lifecycle methods evolve.
 type NFT interface {
-	EnsureTables(ctx context.Context, realIface string) error
 	AddTargetDrop(ctx context.Context, mac net.HardwareAddr) error
 	AddTargetMark(ctx context.Context, mac net.HardwareAddr, mark uint32) error
 	AddReturnMark(ctx context.Context, mac, gwMAC net.HardwareAddr, targetIP net.IP, mark uint32) error
 	RemoveTarget(ctx context.Context, mac net.HardwareAddr) error
-	Teardown(ctx context.Context) error
 }
 
 type TC interface {
-	EnsureIFB(ctx context.Context) error
-	EnsureCaptureIface(ctx context.Context) error
-	EnsureRedirect(ctx context.Context, realIface string) error
 	SetThrottle(ctx context.Context, realIface, mac, rate string, mark uint32) error
 	ClearThrottle(ctx context.Context, realIface, mac string, mark uint32) error
 	SetCapture(ctx context.Context, realIface, mac string, mark uint32) error
 	ClearCapture(ctx context.Context, realIface string, mark uint32) error
-	Teardown(ctx context.Context) error
 }
 
 type Pcap interface {

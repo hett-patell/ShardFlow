@@ -78,8 +78,11 @@ func buildQuery(name string) []byte {
 	return b
 }
 
-// parseMDNS extracts every A record in the response and calls onObs once
-// per record. Non-A answers are skipped.
+// parseMDNS extracts useful records from the response and calls onObs once
+// per record found. Handles A (hostname↔IP), SRV (service→target), and
+// PTR (service-discovery pointer) records — each independently observable
+// in normal Bonjour traffic. Records that don't carry usable identity
+// information are skipped without aborting the parse.
 func parseMDNS(pkt []byte, src *net.UDPAddr, onObs func(devicestore.Observation)) {
 	var p dnsmessage.Parser
 	if _, err := p.Start(pkt); err != nil {
@@ -104,6 +107,47 @@ func parseMDNS(pkt []byte, src *net.UDPAddr, onObs func(devicestore.Observation)
 			onObs(devicestore.Observation{
 				Hostname: trimDot(h.Name.String()),
 				IP:       net.IP{r.A[0], r.A[1], r.A[2], r.A[3]},
+				Seen:     time.Now(),
+			})
+		case dnsmessage.TypeSRV:
+			// SRV's Target field is the actual hostname; the answer
+			// header name is the service name (e.g.
+			// "Kitchen._printer._tcp.local."). Use Target for the
+			// device's hostname and leave IP for an A record to fill in.
+			r, err := p.SRVResource()
+			if err != nil {
+				continue
+			}
+			target := trimDot(r.Target.String())
+			if target == "" {
+				continue
+			}
+			onObs(devicestore.Observation{
+				Hostname: target,
+				Seen:     time.Now(),
+			})
+		case dnsmessage.TypePTR:
+			// PTR points service.type.local. → instance-name.service.type.local.
+			// The pointed-to name carries the device's friendly instance name,
+			// which is genuinely useful when no A record was sent in the same
+			// response (common with Apple printers / Sonos). Skip the
+			// generic _services._dns-sd._udp PTR (the meta-service answer to
+			// our own query), since its target is just a service-type and
+			// not a device.
+			r, err := p.PTRResource()
+			if err != nil {
+				continue
+			}
+			ownerName := trimDot(h.Name.String())
+			if strings.HasPrefix(ownerName, "_services._dns-sd._udp") {
+				continue
+			}
+			ptrName := trimDot(r.PTR.String())
+			if ptrName == "" {
+				continue
+			}
+			onObs(devicestore.Observation{
+				Hostname: ptrName,
 				Seen:     time.Now(),
 			})
 		default:

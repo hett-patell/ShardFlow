@@ -107,28 +107,82 @@ func TestSetPolicyConcurrentRMWDoesNotClobber(t *testing.T) {
 	require.Len(t, snap, 2, "both policies must survive the RMW serialisation")
 }
 
+// TestServerDispatchesHandlersConcurrently pins the property that a slow
+// handler does NOT block a fast handler on the same connection. The
+// earlier implementation called handlers synchronously inside the read
+// loop, so a Scan stuck inside WritePacketData on a contended Wi-Fi link
+// also stalled DevicesList / SessionGet / Stats — the TUI would freeze
+// entirely while a single slow operation ran. The fix dispatches each
+// request in its own goroutine; this test catches a regression by timing
+// the round-trip of a fast call issued while a slow call is in flight.
+func TestServerDispatchesHandlersConcurrently(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "s.sock")
+	slowDone := make(chan struct{})
+	srv := NewServer(map[string]Handler{
+		"slow": func(ctx context.Context, _ json.RawMessage) (any, *Error) {
+			select {
+			case <-slowDone:
+				return "ok", nil
+			case <-ctx.Done():
+				return nil, &Error{Code: CodeInternalError, Message: ctx.Err().Error()}
+			}
+		},
+		"fast": func(_ context.Context, _ json.RawMessage) (any, *Error) {
+			return "ok", nil
+		},
+	})
+	go func() { _ = srv.Listen(context.Background(), sock) }()
+	t.Cleanup(func() { close(slowDone); _ = srv.Stop(); _ = os.Remove(sock) })
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(sock); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	conn, err := net.Dial("unix", sock)
+	require.NoError(t, err)
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+
+	// Write the slow request first; it parks inside the handler.
+	slow, _ := json.Marshal(Request{JSONRPC: "2.0", ID: json.RawMessage(`1`), Method: "slow"})
+	_, _ = conn.Write(append(slow, '\n'))
+
+	// Then the fast one. With concurrent dispatch this returns
+	// immediately; with the old serial dispatch it would only return
+	// after slowDone was closed.
+	fast, _ := json.Marshal(Request{JSONRPC: "2.0", ID: json.RawMessage(`2`), Method: "fast"})
+	_, _ = conn.Write(append(fast, '\n'))
+
+	deadline := time.Now().Add(2 * time.Second)
+	_ = conn.SetReadDeadline(deadline)
+	line, err := br.ReadBytes('\n')
+	require.NoError(t, err, "fast request must complete while slow is in flight")
+	var resp Response
+	require.NoError(t, json.Unmarshal(line, &resp))
+	var idNum int
+	_ = json.Unmarshal(resp.ID, &idNum)
+	assert.Equal(t, 2, idNum, "first response must be the fast one (id=2), proving concurrency")
+}
+
 // no-op effectors for testing.
 type noopNFT struct{}
 
-func (noopNFT) EnsureTables(context.Context, string) error                              { return nil }
-func (noopNFT) AddTargetDrop(context.Context, net.HardwareAddr) error                   { return nil }
-func (noopNFT) AddTargetMark(context.Context, net.HardwareAddr, uint32) error           { return nil }
+func (noopNFT) AddTargetDrop(context.Context, net.HardwareAddr) error         { return nil }
+func (noopNFT) AddTargetMark(context.Context, net.HardwareAddr, uint32) error { return nil }
 func (noopNFT) AddReturnMark(context.Context, net.HardwareAddr, net.HardwareAddr, net.IP, uint32) error {
 	return nil
 }
 func (noopNFT) RemoveTarget(context.Context, net.HardwareAddr) error { return nil }
-func (noopNFT) Teardown(context.Context) error                       { return nil }
 
 type noopTC struct{}
 
-func (noopTC) EnsureIFB(context.Context) error                              { return nil }
-func (noopTC) EnsureCaptureIface(context.Context) error                     { return nil }
-func (noopTC) EnsureRedirect(context.Context, string) error                 { return nil }
 func (noopTC) SetThrottle(context.Context, string, string, string, uint32) error { return nil }
-func (noopTC) ClearThrottle(context.Context, string, string, uint32) error  { return nil }
-func (noopTC) SetCapture(context.Context, string, string, uint32) error     { return nil }
-func (noopTC) ClearCapture(context.Context, string, uint32) error           { return nil }
-func (noopTC) Teardown(context.Context) error                               { return nil }
+func (noopTC) ClearThrottle(context.Context, string, string, uint32) error       { return nil }
+func (noopTC) SetCapture(context.Context, string, string, uint32) error          { return nil }
+func (noopTC) ClearCapture(context.Context, string, uint32) error                { return nil }
 
 type noopPcap struct{}
 

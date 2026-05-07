@@ -1,6 +1,7 @@
 package passive
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/google/gopacket"
@@ -73,6 +74,41 @@ func TestParseARPRejectsProbe(t *testing.T) {
 
 	_, ok := parseARP(pkt)
 	assert.False(t, ok, "ARP probes (SPA=0.0.0.0) must be rejected")
+}
+
+// TestDecodeNetBIOSName exercises the first-level NetBIOS encoding
+// reversal directly. The encoded form for the 16-byte name "ALICE-PC"
+// (space-padded to 15 chars + 0x20 suffix) is the 32-byte sequence
+// produced by splitting each output byte into two nibbles and OR'ing
+// each with 0x41.
+func TestDecodeNetBIOSName(t *testing.T) {
+	// Build the encoded form for "ALICE-PC" + 7 trailing spaces +
+	// suffix 0x20 (workstation).
+	raw := []byte("ALICE-PC       ")
+	if len(raw) != 15 {
+		t.Fatalf("internal: raw must be 15 chars, got %d", len(raw))
+	}
+	plain := append(raw, 0x20)
+	encoded := make([]byte, 32)
+	for i, b := range plain {
+		encoded[i*2] = ((b >> 4) & 0x0F) + 'A'
+		encoded[i*2+1] = (b & 0x0F) + 'A'
+	}
+	name, ok := decodeNetBIOSName(encoded)
+	require.True(t, ok)
+	assert.Equal(t, "ALICE-PC", name)
+}
+
+func TestDecodeNetBIOSNameRejectsBadLength(t *testing.T) {
+	_, ok := decodeNetBIOSName([]byte("FOOBAR"))
+	assert.False(t, ok)
+}
+
+func TestDecodeNetBIOSNameRejectsBadChars(t *testing.T) {
+	// 32 valid-length bytes but containing 'Z' (out of A..P range).
+	bad := bytes.Repeat([]byte("Z"), 32)
+	_, ok := decodeNetBIOSName(bad)
+	assert.False(t, ok)
 }
 
 func TestParseDHCPSetsVendor(t *testing.T) {

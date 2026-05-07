@@ -89,6 +89,35 @@ func TestSetPolicyUnknownMAC(t *testing.T) {
 	assert.False(t, ok)
 }
 
+func TestEvictDropsStaleDevicesAndPreservesPolicied(t *testing.T) {
+	s := New()
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+	fresh := now.Add(-1 * time.Minute)
+
+	// Stale device with no policy → should be evicted.
+	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:01"), IP: net.ParseIP("10.0.0.10"), Seen: old})
+	// Stale device WITH a policy → must survive (operator owns it).
+	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:02"), IP: net.ParseIP("10.0.0.11"), Seen: old})
+	require.True(t, s.SetPolicy(mac("aa:bb:cc:dd:ee:02"), "drop"))
+	// Fresh device → must survive regardless of policy.
+	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:03"), IP: net.ParseIP("10.0.0.12"), Seen: fresh})
+
+	n := s.Evict(now, time.Hour)
+	assert.Equal(t, 1, n, "exactly the stale-no-policy device must be evicted")
+
+	_, ok := s.Get(mac("aa:bb:cc:dd:ee:01"))
+	assert.False(t, ok, "stale unpolicied device must be gone")
+	_, ok = s.Get(mac("aa:bb:cc:dd:ee:02"))
+	assert.True(t, ok, "stale-but-policied device must survive")
+	_, ok = s.Get(mac("aa:bb:cc:dd:ee:03"))
+	assert.True(t, ok, "fresh device must survive")
+
+	// byIP must stay in sync with byMAC after eviction.
+	_, ok = s.ResolveIP(net.ParseIP("10.0.0.10"))
+	assert.False(t, ok, "byIP entry for evicted device must also be cleared")
+}
+
 func TestSetPolicyKnownMACBroadcastsUpdate(t *testing.T) {
 	s := New()
 	ch := s.Subscribe()

@@ -28,6 +28,22 @@ func TestBuildARPRequestFrame(t *testing.T) {
 	assert.Equal(t, "10.0.0.42", net.IP(arp.DstProtAddress).String())
 }
 
+// TestARPRequestDstIPOffset pins the byte offset of DstProtAddress in
+// the serialised Eth+ARP request frame. Sweep relies on this offset to
+// patch each iteration's destination IP into a pre-built template; if
+// gopacket ever changes the wire layout (or someone "improves"
+// buildARPRequest with options), this test catches it before the live
+// sweep silently broadcasts zero-IP requests.
+func TestARPRequestDstIPOffset(t *testing.T) {
+	srcMAC, _ := net.ParseMAC("aa:bb:cc:dd:ee:01")
+	frame, err := buildARPRequest(srcMAC, net.ParseIP("10.0.0.5").To4(), net.ParseIP("1.2.3.4").To4())
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(frame), 42, "minimum Eth+ARP request size")
+	const dstIPOffset = 0x26
+	assert.Equal(t, []byte{1, 2, 3, 4}, frame[dstIPOffset:dstIPOffset+4],
+		"buildARPRequest must place DstProtAddress at offset 0x26 — Sweep's pre-built template patches there")
+}
+
 func TestNextIPCarry(t *testing.T) {
 	cases := []struct {
 		in, want string

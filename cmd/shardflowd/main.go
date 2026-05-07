@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -22,7 +23,32 @@ import (
 	"github.com/hett-patell/ShardFlow/internal/scan/passive"
 	"github.com/hett-patell/ShardFlow/internal/scan/ssdp"
 	"github.com/hett-patell/ShardFlow/internal/tcmgr"
+	"github.com/hett-patell/ShardFlow/internal/wifi"
 )
+
+// scanStats tracks the most recent active sweep's results so the
+// SESSION panel in the TUI can flag AP isolation (zero replies on a
+// wireless iface = strong hint that the AP filters intra-client
+// traffic — typical guest WiFi setup). Atomically updated by the
+// scanner closure.
+type scanStats struct {
+	mu       sync.Mutex
+	lastAt   time.Time
+	replies  int
+}
+
+func (s *scanStats) record(replies int) {
+	s.mu.Lock()
+	s.lastAt = time.Now()
+	s.replies = replies
+	s.mu.Unlock()
+}
+
+func (s *scanStats) snapshot() (time.Time, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastAt, s.replies
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -82,18 +108,33 @@ func run() (err error) {
 		_, _ = writeSysctl("/proc/sys/net/ipv4/conf/"+info.Name+"/send_redirects", prevRedirIface)
 	}()
 
-	fmt.Fprintln(os.Stderr, "shardflowd: resolving gateway MAC...")
-	gwMAC, err := resolveGatewayMAC(info)
-	if err != nil {
-		return fmt.Errorf("resolve gateway MAC: %w", err)
-	}
-	fmt.Fprintf(os.Stderr, "shardflowd: gateway MAC = %s\n", gwMAC)
+	// Gateway MAC resolution runs in parallel with nft/tc Ensure* because
+	// it spends most of its time sleeping (UDP kicks every 500ms, polling
+	// the kernel neighbour table) — independent of any kernel-state setup
+	// we're doing. Worst-case startup goes from ~8s sequential to whatever
+	// the longer of {gw resolution, EnsureX chain} takes (typically the
+	// EnsureX chain at ~250ms, so we save up to 7.5s on a cold start).
+	gwMACCh := make(chan struct {
+		mac net.HardwareAddr
+		err error
+	}, 1)
+	go func() {
+		fmt.Fprintln(os.Stderr, "shardflowd: resolving gateway MAC (background)...")
+		mac, err := resolveGatewayMAC(info)
+		gwMACCh <- struct {
+			mac net.HardwareAddr
+			err error
+		}{mac, err}
+	}()
 
 	store := devicestore.New()
 	nft := nftmgr.New()
 	tcm := tcmgr.New()
 	pc := pcapwriter.New()
-	arp := arpengine.New(info.Name, info.HwAddr, *poisonCadence)
+	arp, err := arpengine.New(info.Name, info.HwAddr, *poisonCadence)
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(os.Stderr, "shardflowd: poison cadence = %s (≈ %.0f bursts/sec/target)\n",
 		*poisonCadence, float64(time.Second)/float64(*poisonCadence))
 	comp := policycompiler.New(nft, tcm, pc, arp, info.Name)
@@ -108,7 +149,8 @@ func run() (err error) {
 			_ = comp.Apply(context.Background(), map[string]policycompiler.Spec{})
 			_ = nft.Teardown(context.Background())
 			_ = pc.CloseAll()
-			_ = tcm.Teardown(context.Background())
+			_ = tcm.Teardown(context.Background(), info.Name)
+			_ = arp.Close() // release shared pcap handle
 		})
 	}
 	defer func() {
@@ -163,6 +205,17 @@ func run() (err error) {
 		return err
 	}
 
+	// Now collect the gateway MAC. By the time the EnsureX chain above
+	// has run (~250ms), the background resolver has almost always
+	// finished — so this receive is usually instant. On a slow LAN we
+	// still wait its full 8s budget.
+	gwRes := <-gwMACCh
+	if gwRes.err != nil {
+		return fmt.Errorf("resolve gateway MAC: %w", gwRes.err)
+	}
+	gwMAC := gwRes.mac
+	fmt.Fprintf(os.Stderr, "shardflowd: gateway MAC = %s\n", gwMAC)
+
 	go func() { _ = passive.Run(ctx, info.Name, store.Upsert) }()
 
 	enrich := func(obs devicestore.Observation) {
@@ -174,15 +227,67 @@ func run() (err error) {
 		store.Upsert(obs)
 	}
 
+	stats := &scanStats{}
+
 	scanner := func(ctx context.Context) error {
+		// Active ARP sweep first: gives us the (MAC, IP) backbone the
+		// later mDNS/SSDP enrich callbacks rely on for IP→MAC resolution.
+		// mDNS and SSDP run concurrently afterwards because they're
+		// independent multicast queries — sequential they took ~6s
+		// total; parallel cuts it to ~3s and the operator's "scan
+		// frozen" window halves.
 		actCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		if err := active.Sweep(actCtx, info.Name, info.HwAddr, info.IP, info.IPNet, 2*time.Second, store.Upsert); err != nil {
+
+		// Wrap store.Upsert so we can count unique reply MACs from
+		// the active sweep specifically. The result is the AP-isolation
+		// diagnostic exposed via Session.Get: on a wireless iface
+		// with a healthy scan we expect at least the gateway plus a
+		// handful of clients; <= 1 reply = strong hint isolation is on.
+		seen := make(map[string]struct{})
+		var seenMu sync.Mutex
+		myMAC := info.HwAddr.String()
+		countObs := func(obs devicestore.Observation) {
+			if len(obs.MAC) > 0 {
+				m := obs.MAC.String()
+				if m != myMAC {
+					seenMu.Lock()
+					seen[m] = struct{}{}
+					seenMu.Unlock()
+				}
+			}
+			store.Upsert(obs)
+		}
+		if err := active.Sweep(actCtx, info.Name, info.HwAddr, info.IP, info.IPNet, 2*time.Second, countObs); err != nil {
+			stats.record(len(seen))
 			return err
 		}
-		_ = mdns.Query(actCtx, info.Name, 3*time.Second, enrich)
-		_ = ssdp.Query(actCtx, info.Name, 3*time.Second, enrich)
+		stats.record(len(seen))
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = mdns.Query(actCtx, info.Name, 3*time.Second, enrich)
+		}()
+		go func() {
+			defer wg.Done()
+			_ = ssdp.Query(actCtx, info.Name, 3*time.Second, enrich)
+		}()
+		wg.Wait()
 		return nil
+	}
+
+	// Probe wireless association once at startup. SSID/BSSID won't change
+	// during a session (a roam swaps the BSSID but operators typically
+	// run shardflowd on a fixed iface bound to a fixed AP). Re-probing
+	// per Session.Get would be wasted shell-out cost.
+	wifiInfo := wifi.Probe(info.Name)
+	if wifiInfo.Wireless && wifiInfo.SSID != "" {
+		fmt.Fprintf(os.Stderr, "shardflowd: wifi assoc → ssid=%q bssid=%s signal=%ddBm\n",
+			wifiInfo.SSID, wifiInfo.BSSID, wifiInfo.SignalDBm)
+	} else if wifiInfo.Wireless {
+		fmt.Fprintln(os.Stderr, "shardflowd: wifi iface present but not associated — skipping SSID probe")
 	}
 
 	deps = &rpc.HandlerDeps{
@@ -198,6 +303,39 @@ func run() (err error) {
 		},
 		ActivePoisons:  func() int { return len(arp.Active()) },
 		DefaultPcapDir: *defaultPcapDir,
+		Session: func() rpc.SessionDTO {
+			lastAt, replies := stats.snapshot()
+			cidrStr := ""
+			if info.IPNet != nil {
+				cidrStr = info.IPNet.String()
+			}
+			gwStr := ""
+			if info.Gateway != nil {
+				gwStr = info.Gateway.String()
+			}
+			lastAtStr := ""
+			if !lastAt.IsZero() {
+				lastAtStr = lastAt.Format(time.RFC3339)
+			}
+			return rpc.SessionDTO{
+				Iface:           info.Name,
+				MAC:             info.HwAddr.String(),
+				IP:              info.IP.String(),
+				CIDR:            cidrStr,
+				Gateway:         gwStr,
+				GwMAC:           gwMAC.String(),
+				Wireless:        wifiInfo.Wireless,
+				SSID:            wifiInfo.SSID,
+				BSSID:           wifiInfo.BSSID,
+				SignalDBm:       wifiInfo.SignalDBm,
+				TxRateMbit:      wifiInfo.TxRateMbit,
+				FreqMHz:         wifiInfo.FreqMHz,
+				PoisonsActive:   len(arp.Active()),
+				DevicesTotal:    len(store.List()),
+				LastScanAt:      lastAtStr,
+				LastScanReplies: replies,
+			}
+		},
 	}
 	handlers := rpc.BuildHandlers(deps)
 	srv = rpc.NewServer(handlers)
@@ -213,18 +351,42 @@ func run() (err error) {
 				if !ok {
 					return
 				}
-				method := rpc.EventDeviceUpdated
-				if ev.Kind == devicestore.EventDiscovered {
+				var method string
+				switch ev.Kind {
+				case devicestore.EventDiscovered:
 					method = rpc.EventDeviceDiscovered
+				case devicestore.EventEvicted:
+					method = rpc.EventDeviceEvicted
+				default:
+					method = rpc.EventDeviceUpdated
 				}
 				dto := rpc.DeviceDTO{
 					MAC:      ev.Device.MAC.String(),
 					IP:       ev.Device.IP.String(),
 					Hostname: ev.Device.Hostname,
 					Vendor:   ev.Device.Vendor,
+					Model:    ev.Device.Model,
 					LastSeen: ev.Device.LastSeen.Format(time.RFC3339),
 				}
 				srv.Broadcast(method, dto)
+			}
+		}
+	}()
+
+	// Periodic eviction sweep. 30 min TTL, swept every minute. Devices
+	// with active policies are preserved regardless. This bounds memory
+	// on long-running sessions (a Wi-Fi sniff seeing privacy-randomised
+	// MACs from a coffee shop's worth of phones grew unbounded otherwise).
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		const deviceTTL = 30 * time.Minute
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				_ = store.Evict(time.Now(), deviceTTL)
 			}
 		}
 	}()
@@ -237,7 +399,13 @@ func run() (err error) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				srv.Broadcast(rpc.EventCountersTick, map[string]any{"ts": time.Now().Unix()})
+				// Skip the heartbeat when no client is around to
+				// receive it. The TUI uses this to anchor its
+				// "daemon alive" indicator, so we only need to send
+				// when at least one consumer cares.
+				if srv.HasClients() {
+					srv.Broadcast(rpc.EventCountersTick, map[string]any{"ts": time.Now().Unix()})
+				}
 			}
 		}
 	}()

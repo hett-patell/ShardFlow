@@ -21,6 +21,7 @@ func NewRoot() *cobra.Command {
 	root.AddCommand(devicesCmd())
 	root.AddCommand(policyCmd())
 	root.AddCommand(statsCmd())
+	root.AddCommand(sessionCmd())
 	root.AddCommand(tuiCmd())
 	return root
 }

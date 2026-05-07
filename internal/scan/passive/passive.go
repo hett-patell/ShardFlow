@@ -16,7 +16,11 @@ import (
 )
 
 // Run blocks until ctx is done. Every observation extracted from a
-// supported broadcast frame is passed to onObs.
+// supported broadcast frame is passed to onObs. The order of parsers
+// matters: ARP/DHCP yield strictly more identity info than the generic
+// UDP-broadcast parser, so try them first; the UDP-broadcast fallback
+// is what extracts (MAC, IP) from mDNS/SSDP/NetBIOS frames whose upper
+// protocol we don't parse, plus mDNS hostname enrichment when present.
 func Run(ctx context.Context, ifaceName string, onObs func(devicestore.Observation)) error {
 	handle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
 	if err != nil {
@@ -44,7 +48,17 @@ func Run(ctx context.Context, ifaceName string, onObs func(devicestore.Observati
 				onObs(obs)
 				continue
 			}
-			// mDNS/NetBIOS/SSDP parsing comes in Task 2.3.
+			if obs, ok := parseMDNSAnswer(pkt); ok {
+				onObs(obs)
+				continue
+			}
+			if obs, ok := parseNetBIOS(pkt); ok {
+				onObs(obs)
+				continue
+			}
+			if obs, ok := parseUDPBroadcast(pkt); ok {
+				onObs(obs)
+			}
 		}
 	}
 }

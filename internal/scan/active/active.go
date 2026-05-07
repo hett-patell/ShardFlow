@@ -3,8 +3,10 @@
 package active
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -16,6 +18,16 @@ import (
 	"github.com/hett-patell/ShardFlow/internal/devicestore"
 	"github.com/hett-patell/ShardFlow/internal/oui"
 )
+
+// sendBudget is the wall-clock cap on the ARP send phase. Independent of
+// how many hosts the CIDR contains: on a fast LAN /16 finishes the send
+// phase in ~6.5s with our 100µs pacing, on a contended Wi-Fi link each
+// WritePacketData can block on kernel TX backpressure for tens of
+// milliseconds and a full /16 then takes minutes. We'd rather cover the
+// first ~hundreds of IPs (which are typically the operator's own /24,
+// since the kernel iterates the CIDR in order) and let passive sniffing
+// fill in the rest than have the dashboard hang.
+const sendBudget = 3 * time.Second
 
 // Sweep sends ARP requests for every host in cidr from the operator's
 // (srcMAC, srcIP) on the given iface, listens for replies for window, and
@@ -79,18 +91,73 @@ func Sweep(ctx context.Context, ifaceName string, srcMAC net.HardwareAddr, srcIP
 
 	// Sender loop — also respects ctx so a cancelled sweep doesn't block
 	// flushing the entire CIDR through the kernel.
+	//
+	// Pacing: on Wi-Fi a /24 (256 frames) takes <50ms unpaced and is fine,
+	// but a /16 (65k frames) saturates the AP for ~1s and we lose replies
+	// to our own back-pressure. We rate-cap at ~10k frames/sec by sleeping
+	// 100µs between sends — total time for a /24 is ~25ms (negligible),
+	// for a /16 is ~6.5s (vs the listener window, which the caller sets
+	// at 2s; tune up at your CIDR's discretion).
+	hostBits, _ := cidr.Mask.Size()
+	totalHosts := 1 << uint(32-hostBits)
+	const pacingThreshold = 256
+	pacingDelay := time.Duration(0)
+	if totalHosts > pacingThreshold {
+		pacingDelay = 100 * time.Microsecond
+	}
+	// Pre-build the Eth+ARP frame once. Only DstProtAddress (offset
+	// 0x26..0x29) changes per iteration; everything else — DstMAC,
+	// SrcMAC, EtherType, ARP operation, source addresses — is constant.
+	// On a /16 sweep this avoids ~65k allocations and ~65k gopacket
+	// serialise passes. The shape is verified once via gopacket so we
+	// don't hand-spell a wire format that drifts from the layers
+	// definition.
+	tmpl, err := buildARPRequest(srcMAC, srcIP, net.IPv4(0, 0, 0, 0).To4())
+	if err != nil {
+		return err
+	}
+	if len(tmpl) < 42 {
+		return fmt.Errorf("internal: ARP template too short (%d bytes)", len(tmpl))
+	}
+	frame := append([]byte(nil), tmpl...)
+	const dstIPOffset = 0x26 // 14 (eth) + 24 (ARP up to TPA) = 38 = 0x26
+	srcIP4 := srcIP.To4()
+	sendStart := time.Now()
+	sent := 0
 	for ip := nextIP(cidr.IP.Mask(cidr.Mask)); cidr.Contains(ip); ip = nextIP(ip) {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		frame, err := buildARPRequest(srcMAC, srcIP, ip)
-		if err != nil {
-			return err
+		// Wall-clock send budget: WritePacketData can block on the
+		// kernel TX queue when Wi-Fi contention is high, so the ctx
+		// deadline alone isn't enough — we'd be stuck inside the call
+		// when the deadline fires. Stop early instead and let the
+		// listener window run; whatever replies we got plus passive
+		// sniffing will populate the device store.
+		if time.Since(sendStart) >= sendBudget {
+			log.Printf("active sweep: send budget reached after %d frames in %s; %d hosts unscanned (passive sniffing will pick them up)",
+				sent, sendBudget, totalHosts-sent)
+			break
 		}
+		ip4 := ip.To4()
+		if ip4 == nil {
+			continue
+		}
+		// Don't send an ARP request to ourselves — we already know our
+		// own MAC, and it just generates a self-reply that the listener
+		// has to filter.
+		if srcIP4 != nil && bytes.Equal(ip4, srcIP4) {
+			continue
+		}
+		copy(frame[dstIPOffset:dstIPOffset+4], ip4)
 		if err := handle.WritePacketData(frame); err != nil {
 			return fmt.Errorf("send: %w", err)
+		}
+		sent++
+		if pacingDelay > 0 {
+			time.Sleep(pacingDelay)
 		}
 	}
 

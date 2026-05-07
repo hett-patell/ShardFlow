@@ -10,7 +10,19 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
+	"time"
 )
+
+// cmdTimeout caps every ip/tc invocation. Same rationale as nftmgr's:
+// a wedged netlink call must not hang the policy compiler.
+const cmdTimeout = 10 * time.Second
+
+func withTimeout(parent context.Context) (context.Context, context.CancelFunc) {
+	if dl, ok := parent.Deadline(); ok && time.Until(dl) < cmdTimeout {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, cmdTimeout)
+}
 
 const (
 	IFBName     = "shardflow0"
@@ -25,7 +37,9 @@ type Runner interface {
 type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, bin string, args []string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, bin, args...)
+	tCtx, cancel := withTimeout(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(tCtx, bin, args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -169,18 +183,28 @@ func (m *Manager) ClearCapture(ctx context.Context, realIface string, mark uint3
 	return nil
 }
 
-// Teardown removes both ShardFlow ifaces. The real iface's ingress qdisc is
-// left in place because removing it would also destroy any unrelated tc
-// state; per-mark filters were already cleared by ClearThrottle /
-// ClearCapture (the daemon's shutdown calls comp.Apply with empty desired
-// before this). Returns the first non-missing error encountered.
-func (m *Manager) Teardown(ctx context.Context) error {
+// Teardown removes both ShardFlow ifaces and the ingress qdisc on the
+// real iface. The qdisc is owned by ShardFlow (we created it via
+// EnsureRedirect) so leaving it behind for the next run's preflight to
+// notice and complain about is just noise; clean shutdown means clean
+// kernel state. realIface may be empty when called from a context that
+// no longer knows the iface (e.g. unit tests with a fake runner) — in
+// which case the qdisc step is skipped. Returns the first non-missing
+// error encountered.
+func (m *Manager) Teardown(ctx context.Context, realIface string) error {
 	var firstErr error
-	for _, name := range []string{IFBName, CaptureName} {
-		out, err := m.r.Run(ctx, "ip", argvDelLink(name))
+	record := func(out []byte, err error) {
 		if err != nil && !isMissing(out) && firstErr == nil {
 			firstErr = err
 		}
+	}
+	for _, name := range []string{IFBName, CaptureName} {
+		out, err := m.r.Run(ctx, "ip", argvDelLink(name))
+		record(out, err)
+	}
+	if realIface != "" {
+		out, err := m.r.Run(ctx, "tc", argvDelIngressQdisc(realIface))
+		record(out, err)
 	}
 	return firstErr
 }

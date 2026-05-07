@@ -62,8 +62,9 @@ type DeviceDTO struct {
 	MAC      string `json:"mac"`
 	IP       string `json:"ip"`
 	Hostname string `json:"hostname"`
-	Vendor   string `json:"vendor"`
-	LastSeen string `json:"last_seen"` // RFC 3339; time.Time also marshals OK but string keeps the wire stable
+	Vendor   string `json:"vendor"` // OUI vendor (silicon maker)
+	Model    string `json:"model,omitempty"` // SSDP SERVER (firmware/device kind)
+	LastSeen string `json:"last_seen"`       // RFC 3339; time.Time also marshals OK but string keeps the wire stable
 	Policy   string `json:"policy,omitempty"`
 }
 
@@ -94,6 +95,32 @@ type PolicySpec struct {
 	PcapDir  string     `json:"pcap_dir,omitempty"`  // pcap only; empty = default
 }
 
+// SessionDTO describes the operator's connection at a moment in time:
+// the network they're pentesting (iface, IP, gateway, optionally WiFi
+// SSID/BSSID/signal) plus a few diagnostic counters from the most
+// recent scan. The TUI's SESSION panel displays this; the AP-isolation
+// hint is computed client-side from Wireless && LastScanReplies <= 1.
+type SessionDTO struct {
+	Iface   string `json:"iface"`
+	MAC     string `json:"mac"`
+	IP      string `json:"ip"`
+	CIDR    string `json:"cidr"` // e.g. "10.0.0.42/24"
+	Gateway string `json:"gateway"`
+	GwMAC   string `json:"gw_mac"`
+
+	Wireless   bool    `json:"wireless"`
+	SSID       string  `json:"ssid,omitempty"`
+	BSSID      string  `json:"bssid,omitempty"`
+	SignalDBm  int     `json:"signal_dbm,omitempty"`
+	TxRateMbit float64 `json:"tx_rate_mbit,omitempty"`
+	FreqMHz    int     `json:"freq_mhz,omitempty"`
+
+	PoisonsActive   int    `json:"poisons_active"`
+	DevicesTotal    int    `json:"devices_total"`
+	LastScanAt      string `json:"last_scan_at,omitempty"` // RFC 3339
+	LastScanReplies int    `json:"last_scan_replies"`      // unique reply MACs
+}
+
 // Method names, exported as constants so client and server can't drift.
 const (
 	MethodScan        = "Scan"
@@ -103,12 +130,14 @@ const (
 	MethodPolicyClear = "Policy.Clear"
 	MethodPolicyList  = "Policy.List"
 	MethodStats       = "Stats"
+	MethodSessionGet  = "Session.Get"
 )
 
 // Event method names.
 const (
 	EventDeviceDiscovered = "device.discovered"
 	EventDeviceUpdated    = "device.updated"
+	EventDeviceEvicted    = "device.evicted"
 	EventPolicyApplied    = "policy.applied"
 	EventCountersTick     = "counters.tick"
 	EventPcapRotated      = "pcap.rotated"
