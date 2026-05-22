@@ -7,6 +7,11 @@
 
 # ShardFlow
 
+[![Release](https://img.shields.io/github/v/release/hett-patell/ShardFlow?color=blue)](https://github.com/hett-patell/ShardFlow/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Authorized Use Only](https://img.shields.io/badge/Use-Authorized%20Lab%20Only-red.svg)](#)
+[![Go Report Card](https://goreportcard.com/badge/github.com/hett-patell/ShardFlow)](https://goreportcard.com/report/github.com/hett-patell/ShardFlow)
+
 A Layer-2 LAN workbench for people who want to know exactly who's on their network and, optionally, ruin their day.
 
 Finds every device on the wire. Drops them, throttles them, or silently records everything they send. Built for red-team labs, ethics class demos, and anyone whose upstairs neighbour discovered Twitch streaming at midnight.
@@ -177,3 +182,22 @@ git commit -m "chore: refresh OUI db"
 > "ARP is a protocol from 1982 that nobody has fixed because we'd all rather patch the symptoms forever than admit our network stack is held together with hope and broadcast." — every L2 attacker, ever
 
 Have fun. Don't be evil. Bring snacks.
+
+---
+
+## License
+
+MIT - see [LICENSE](LICENSE).
+
+---
+
+## The Shard ecosystem
+
+| Repo | What it does |
+|---|---|
+| [ShardLure](https://github.com/hett-patell/ShardLure) | SSH honeypot + threat-intel dashboard |
+| [ShardC2](https://github.com/hett-patell/ShardC2) | Red-team C2 framework in Go |
+| [ShardFlow](https://github.com/hett-patell/ShardFlow) | Layer-2 LAN workbench (ARP, drop, throttle) |
+| [ShardShell](https://github.com/hett-patell/ShardShell) | PHP post-exploitation shell |
+| [ShardPass](https://github.com/hett-patell/ShardPass) | Minimal TOTP authenticator (Chrome MV3) |
+| [ShardPet](https://github.com/hett-patell/ShardPet) | Pixel-Pokémon browser extension |
