@@ -73,6 +73,27 @@ type model struct {
 	// showHelp expands the bottom keybind row into a multi-line help
 	// panel listing every shortcut. Toggled with [?].
 	showHelp bool
+
+	// visibleCache memoises the result of visibleDevices() so a single
+	// render pass (which calls it from View, renderStatusBar,
+	// renderDevicesPanel, renderTargetPanel) only filters the device
+	// list ONCE. On a 200-row list with a filter set, the unmemoised
+	// path was rescanning + lowercasing the full list 4-5× per frame
+	// at 4 Hz spinner ticks.
+	//
+	// Invalidation is by stamp: every site that mutates m.filter or
+	// m.devices increments visibleStamp, and visibleDevices recomputes
+	// when visibleStamp != visibleCacheStamp.
+	visibleCache      []deviceRow
+	visibleStamp      uint64
+	visibleCacheStamp uint64
+}
+
+// invalidateVisible bumps the stamp so the next visibleDevices() call
+// recomputes from m.devices and m.filter. Called from every site that
+// mutates either of those fields.
+func (m *model) invalidateVisible() {
+	m.visibleStamp++
 }
 
 func newModel(c *rpc.Client, defaultRateKbit int, defaultPcapDir string) model {
@@ -121,21 +142,42 @@ func (m model) Init() tea.Cmd {
 // visibleDevices returns m.devices filtered by m.filter (substring,
 // case-insensitive match against ip/mac/hostname/vendor). When the
 // filter is empty the original slice is returned without copying.
-func (m model) visibleDevices() []deviceRow {
-	if m.filter == "" {
-		return m.devices
+//
+// Result is memoised on the model: repeat calls during a single render
+// frame (View → renderStatusBar, renderDevicesPanel, renderTargetPanel)
+// reuse the cached slice. Mutations to m.filter or m.devices call
+// invalidateVisible() to bump visibleStamp; this method recomputes only
+// when visibleStamp != visibleCacheStamp. Pointer receiver because the
+// memo write needs to persist back to the caller; Bubble Tea passes m
+// as an addressable parameter in Update/View so this works at call sites.
+func (m *model) visibleDevices() []deviceRow {
+	if m.visibleStamp == m.visibleCacheStamp && m.visibleCache != nil {
+		return m.visibleCache
 	}
-	q := strings.ToLower(m.filter)
-	out := make([]deviceRow, 0, len(m.devices))
-	for _, d := range m.devices {
-		if strings.Contains(strings.ToLower(d.ip), q) ||
-			strings.Contains(strings.ToLower(d.mac), q) ||
-			strings.Contains(strings.ToLower(d.hostname), q) ||
-			strings.Contains(strings.ToLower(d.vendor), q) {
-			out = append(out, d)
+	var out []deviceRow
+	if m.filter == "" {
+		out = m.devices
+	} else {
+		q := strings.ToLower(m.filter)
+		out = make([]deviceRow, 0, len(m.devices))
+		for _, d := range m.devices {
+			if strings.Contains(strings.ToLower(d.ip), q) ||
+				strings.Contains(strings.ToLower(d.mac), q) ||
+				strings.Contains(strings.ToLower(d.hostname), q) ||
+				strings.Contains(strings.ToLower(d.vendor), q) {
+				out = append(out, d)
+			}
 		}
 	}
-	return out
+	m.visibleCache = out
+	m.visibleCacheStamp = m.visibleStamp
+	// Nil sentinel: if filter produced an empty result, the next call
+	// would re-enter the slow path because visibleCache == nil. Use an
+	// empty non-nil slice so the memo still hits.
+	if m.visibleCache == nil {
+		m.visibleCache = []deviceRow{}
+	}
+	return m.visibleCache
 }
 
 // devicesViewportHeight estimates how many device rows can fit in the
@@ -201,6 +243,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// full list with one keystroke.
 				m.filterMode = false
 				m.filter = ""
+				m.invalidateVisible()
 				m.cursor = 0
 				m.viewportOffset = 0
 				return m, nil
@@ -212,6 +255,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case tea.KeyBackspace:
 				if len(m.filter) > 0 {
 					m.filter = m.filter[:len(m.filter)-1]
+					m.invalidateVisible()
 					m.cursor = 0
 					m.viewportOffset = 0
 				}
@@ -219,6 +263,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case tea.KeyRunes:
 				// Append printable runes to the filter string.
 				m.filter += string(msg.Runes)
+				m.invalidateVisible()
 				m.cursor = 0
 				m.viewportOffset = 0
 				return m, nil
@@ -239,6 +284,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch {
 			case m.filter != "":
 				m.filter = ""
+				m.invalidateVisible()
 				m.cursor = 0
 				m.viewportOffset = 0
 			case m.showHelp:
@@ -335,6 +381,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case devicesLoadedMsg:
 		m.devices = msg.rows
+		m.invalidateVisible()
 		m.ensureCursorVisible()
 
 	case sessionLoadedMsg:

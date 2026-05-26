@@ -126,6 +126,62 @@ func TestViewportScrollsForLongList(t *testing.T) {
 	assert.Less(t, m.cursor, m.viewportOffset+height)
 }
 
+// TestVisibleDevicesMemoised asserts that repeated visibleDevices() calls
+// with no intervening filter/devices mutation return the same backing
+// slice. The cache is the whole point: a render frame calls this from
+// View → renderStatusBar, renderDevicesPanel, renderTargetPanel, and
+// without the memo each call rescans + lowercases the whole list.
+func TestVisibleDevicesMemoised(t *testing.T) {
+	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
+	m.devices = []deviceRow{
+		{ip: "10.0.0.1", hostname: "router.local"},
+		{ip: "10.0.0.42", hostname: "het-laptop.local"},
+		{ip: "10.0.0.55", hostname: "phone.local"},
+	}
+	m.filter = "laptop"
+	a := m.visibleDevices()
+	b := m.visibleDevices()
+	// Same backing array = cache hit. Comparing slice headers via a[0] address.
+	if len(a) == 0 || len(b) == 0 {
+		t.Fatalf("expected non-empty filter result, got len(a)=%d len(b)=%d", len(a), len(b))
+	}
+	assert.Same(t, &a[0], &b[0], "second call must reuse cached slice")
+
+	// Mutate filter → next call must recompute (different backing array
+	// is expected since the filter result changed).
+	m.filter = "router"
+	m.invalidateVisible()
+	c := m.visibleDevices()
+	assert.Len(t, c, 1)
+	assert.Equal(t, "router.local", c[0].hostname)
+}
+
+// TestVisibleDevicesEmptyFilterCached asserts that the empty-filter
+// fast path (return m.devices directly) is also memoised — the second
+// call mustn't be confused by the nil-vs-empty distinction.
+func TestVisibleDevicesEmptyFilterCached(t *testing.T) {
+	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
+	m.devices = []deviceRow{{ip: "10.0.0.1"}}
+	a := m.visibleDevices()
+	b := m.visibleDevices()
+	assert.Equal(t, len(a), len(b))
+	assert.Same(t, &a[0], &b[0])
+}
+
+// TestVisibleDevicesEmptyResultStillCached covers the case where a
+// filter matches nothing — the result is a non-nil empty slice and the
+// next call must still hit the memo rather than re-running the scan.
+func TestVisibleDevicesEmptyResultStillCached(t *testing.T) {
+	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
+	m.devices = []deviceRow{{ip: "10.0.0.1"}, {ip: "10.0.0.42"}}
+	m.filter = "no-match-string"
+	a := m.visibleDevices()
+	assert.Empty(t, a)
+	stamp := m.visibleCacheStamp
+	_ = m.visibleDevices()
+	assert.Equal(t, stamp, m.visibleCacheStamp, "second empty-result call must not bump cache stamp")
+}
+
 func TestRenderedViewFitsTerminalWidth(t *testing.T) {
 	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
 	m.width, m.height = 250, 50
