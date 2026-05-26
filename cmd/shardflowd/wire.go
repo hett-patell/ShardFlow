@@ -9,6 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
+
 	"github.com/hett-patell/ShardFlow/internal/iface"
 )
 
@@ -119,15 +122,26 @@ func writeSysctl(path, v string) (string, error) {
 
 // resolveGatewayMAC asks the kernel to resolve info.Gateway's MAC by sending
 // short UDP datagrams (which force ARP via the normal stack), then polls the
-// kernel neighbour table until an entry appears. Going via the kernel is
-// more reliable than crafting the ARP ourselves: in some netns/bridge
-// configurations the peer kernel does not respond to ARP requests
-// originated from packet sockets, even though it answers kernel-originated
-// ARPs. The kick is repeated every 500ms because the kernel gives up after
-// three mcast_solicit attempts and parks the neighbour entry in FAILED for
-// ~60s — re-triggering forces a fresh attempt without waiting that out.
+// kernel neighbour table via netlink until an entry appears. Going via the
+// kernel is more reliable than crafting the ARP ourselves: in some
+// netns/bridge configurations the peer kernel does not respond to ARP
+// requests originated from packet sockets, even though it answers
+// kernel-originated ARPs. The kick is repeated every 500ms because the
+// kernel gives up after three mcast_solicit attempts and parks the
+// neighbour entry in FAILED for ~60s — re-triggering forces a fresh
+// attempt without waiting that out.
+//
+// Previous implementation shelled out to `ip -4 neigh show` every poll
+// (up to 16 forks per startup). Netlink RTM_GETNEIGH is a single syscall
+// per poll, no string parsing, no PATH dependency.
 func resolveGatewayMAC(info iface.Info) (net.HardwareAddr, error) {
-	if mac, ok := readNeighMAC(info.Name, info.Gateway); ok {
+	link, err := netlink.LinkByName(info.Name)
+	if err != nil {
+		return nil, fmt.Errorf("netlink link %s: %w", info.Name, err)
+	}
+	linkIndex := link.Attrs().Index
+
+	if mac, ok := readNeighMAC(linkIndex, info.Gateway); ok {
 		return mac, nil
 	}
 	kick := func() {
@@ -142,7 +156,7 @@ func resolveGatewayMAC(info iface.Info) (net.HardwareAddr, error) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for time.Now().Before(deadline) {
-		if mac, ok := readNeighMAC(info.Name, info.Gateway); ok {
+		if mac, ok := readNeighMAC(linkIndex, info.Gateway); ok {
 			return mac, nil
 		}
 		select {
@@ -154,25 +168,34 @@ func resolveGatewayMAC(info iface.Info) (net.HardwareAddr, error) {
 	return nil, errors.New("timeout resolving gateway MAC via kernel")
 }
 
-// readNeighMAC parses `ip -4 neigh show <gw> dev <iface>` and returns the
-// lladdr if present and reachable. ok=false when the entry is missing,
-// FAILED, or has no lladdr yet.
-func readNeighMAC(iface string, gw net.IP) (net.HardwareAddr, bool) {
-	out, err := exec.Command("ip", "-4", "neigh", "show", gw.String(), "dev", iface).Output()
+// readNeighMAC queries the kernel neighbour table via netlink and returns
+// the lladdr for gw on the named iface index, if present and not in a
+// FAILED/INCOMPLETE state. ok=false when the entry is missing, in a
+// non-resolvable state, or has no HardwareAddr yet.
+//
+// Why iterate NeighList instead of a targeted query: vishvananda/netlink
+// doesn't expose a single-IP RTM_GETNEIGH wrapper; NeighList(linkIndex,
+// AF_INET) returns the few entries on the iface (typically <10 on a
+// home LAN, hundreds at most) so linear scan is faster than the prior
+// fork-and-parse path even in the worst case.
+func readNeighMAC(linkIndex int, gw net.IP) (net.HardwareAddr, bool) {
+	neighs, err := netlink.NeighList(linkIndex, unix.AF_INET)
 	if err != nil {
 		return nil, false
 	}
-	// Format: "10.0.99.1 dev eth0 lladdr xx:xx:xx:xx:xx:xx REACHABLE"
-	fields := strings.Fields(string(out))
-	for i, f := range fields {
-		if f == "FAILED" || f == "INCOMPLETE" {
+	gw4 := gw.To4()
+	for _, n := range neighs {
+		ip4 := n.IP.To4()
+		if ip4 == nil || !ip4.Equal(gw4) {
+			continue
+		}
+		// NUD_FAILED / NUD_INCOMPLETE: kernel tried and gave up, or
+		// is still trying. Either way the lladdr (if any) is stale.
+		if n.State&(unix.NUD_FAILED|unix.NUD_INCOMPLETE) != 0 {
 			return nil, false
 		}
-		if f == "lladdr" && i+1 < len(fields) {
-			mac, err := net.ParseMAC(fields[i+1])
-			if err == nil {
-				return mac, true
-			}
+		if len(n.HardwareAddr) == 6 {
+			return append(net.HardwareAddr{}, n.HardwareAddr...), true
 		}
 	}
 	return nil, false
