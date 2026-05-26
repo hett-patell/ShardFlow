@@ -126,7 +126,9 @@ shardflow --sock /tmp/sf.sock policy set 192.168.1.42 throttle 200kbit
 shardflow --sock /tmp/sf.sock policy set 192.168.1.42 pcap --pcap-dir /tmp/sf-pcap
 shardflow --sock /tmp/sf.sock policy clear 192.168.1.42
 shardflow --sock /tmp/sf.sock policy list
-shardflow --sock /tmp/sf.sock stats
+shardflow --sock /tmp/sf.sock session                # iface, gw, wifi assoc, scan stats
+shardflow --sock /tmp/sf.sock stats                  # --json supported
+shardflow --version                                  # also works on shardflowd
 ```
 
 ---
@@ -143,16 +145,28 @@ Source in `internal/`. It's readable. Probably.
 
 ## Tests
 
-15 unit-test packages, all race-clean:
+17 unit-test packages, all race-clean:
 
 ```bash
 make test    # or: go test ./...
+go test -race ./...    # if you want the race detector to chew on it
 ```
 
 4 integration tests in network namespaces — drop, throttle, pcap, and recovery end-to-end. Need root because they create actual netns and invoke nft / tc:
 
 ```bash
-sudo PATH=$PATH go test -tags=integration ./test/...
+make test-int    # equivalent: sudo go test -tags=integration -v ./test/...
+```
+
+## Local scan sandbox
+
+No LAN handy? Spin up a Linux bridge with N fake netns hosts that auto-reply to ARP. Safe to throttle / drop / poison without disturbing anyone real:
+
+```bash
+sudo make lab-up COUNT=16
+sudo ./scripts/shardflow-up -i sf-lab0
+# press q in the TUI to quit
+sudo make lab-down
 ```
 
 ---
