@@ -95,21 +95,75 @@ func (c *Compiler) Apply(ctx context.Context, desired map[string]Spec) error {
 	}
 
 	// Phase 1: tear down (best-effort across all targets).
+	//
+	// Parallelised: each teardown calls into nft/tc/pcap/arpengine and
+	// these are independent across different MACs at the Go level —
+	// nftmgr/tcmgr.Manager have no shared mutable state (just a Runner
+	// reference, each call spawns a fresh exec.Command), pcapwriter
+	// has its own mutex, arpengine has handleMu serialising its pcap
+	// writes. The kernel-side nft/tc transaction locks serialise
+	// concurrent commands internally so we don't corrupt rule state.
+	//
+	// The win at daemon shutdown matters: scripts/shardflow-up gives a
+	// 5s SIGTERM grace before SIGKILL. With many active policies the
+	// arpengine corrective burst (~1.6s) plus N × sequential
+	// nft/tc/pcap teardowns (~50-300ms each) was exceeding that
+	// budget, leaving real victims poisoned. Parallel teardown collapses
+	// the N × cost to ~max(individual cost) + nft kernel serialisation.
+	type teardownResult struct {
+		mac         string
+		err         error
+		releaseMark bool // mac fully going away (not just kind change)
+	}
+	var teardowns []func() teardownResult
 	for mac, cur := range c.current {
 		want, ok := desired[mac]
-		if !ok || want.Kind != cur.Kind {
-			if err := c.tearDownOne(ctx, cur); err != nil {
-				record(err)
+		if ok && want.Kind == cur.Kind {
+			continue
+		}
+		// Resolve the mark UNDER c.mu before the goroutine starts:
+		// markFor mutates c.markOf/c.nextMark when allocating, and we
+		// don't want concurrent goroutines racing on it. For teardown
+		// of existing policies the mark is always already in c.markOf
+		// (inserted at bringup) so this is a pure read on the fast
+		// path — but doing it here serialises the unlikely alloc case
+		// too.
+		mark := c.markFor(mac)
+		mac, cur, ok, mark := mac, cur, ok, mark
+		teardowns = append(teardowns, func() teardownResult {
+			err := c.tearDownOneWithMark(ctx, cur, mark)
+			return teardownResult{mac: mac, err: err, releaseMark: !ok}
+		})
+	}
+	if len(teardowns) > 0 {
+		results := make(chan teardownResult, len(teardowns))
+		var wg sync.WaitGroup
+		for _, fn := range teardowns {
+			wg.Add(1)
+			go func(fn func() teardownResult) {
+				defer wg.Done()
+				results <- fn()
+			}(fn)
+		}
+		wg.Wait()
+		close(results)
+		// Apply results serially under c.mu (we still hold the write
+		// lock since defer c.mu.Unlock is at the top of Apply).
+		// Releasing marks must be sequential because freeMarks is a
+		// shared slice.
+		for r := range results {
+			if r.err != nil {
+				record(r.err)
 				continue
 			}
-			delete(c.current, mac)
+			delete(c.current, r.mac)
 			// Only release the mark when the target is fully going
 			// away (no replacement in desired). When we're tearing
 			// down to bring up a new policy on the same MAC, keep
 			// the mark stable so the new bringup doesn't trigger a
 			// prio reshuffle in tc.
-			if !ok {
-				c.releaseMark(mac)
+			if r.releaseMark {
+				c.releaseMark(r.mac)
 			}
 		}
 	}
@@ -201,8 +255,16 @@ func (c *Compiler) bringUpOne(ctx context.Context, s Spec) error {
 }
 
 func (c *Compiler) tearDownOne(ctx context.Context, s Spec) error {
+	return c.tearDownOneWithMark(ctx, s, c.markFor(s.Target.MAC.String()))
+}
+
+// tearDownOneWithMark is the lock-free body of tearDownOne, taking the
+// fwmark as a parameter so the parallel teardown path can resolve marks
+// up-front under c.mu and pass them in. Callers from Phase 1 (parallel)
+// use this directly; Phase 2 (serial) uses tearDownOne which wraps it
+// with a markFor call.
+func (c *Compiler) tearDownOneWithMark(ctx context.Context, s Spec, mark uint32) error {
 	macStr := s.Target.MAC.String()
-	mark := c.markFor(macStr)
 
 	var firstErr error
 	record := func(err error) {
