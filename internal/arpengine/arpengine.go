@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -287,26 +288,37 @@ func (e *Engine) sendCorrective(t Target) error {
 	// info), REPLIEs (some embedded receivers prefer reply form), and
 	// gratuitous broadcasts (is_garp bypasses locktime). Empirically
 	// reliable in the netns lab integration tests.
+	//
+	// Write errors are counted (not returned). A corrective burst is
+	// best-effort: by the time we're here the poison goroutine is
+	// already stopped, so failing a few frames is mildly bad (target
+	// might keep our lie longer) but not catastrophic. The shared pcap
+	// handle being dead is the most likely failure mode (Engine.Close
+	// raced with us) — log once at the end so a corrupted shutdown
+	// shows up in journald instead of being silent.
+	var writeErrs int
+	var lastErr error
+	send := func(frame []byte, buildErr error) {
+		if buildErr != nil {
+			return
+		}
+		if err := e.write(frame); err != nil {
+			writeErrs++
+			lastErr = err
+		}
+	}
 	for i := 0; i < 5; i++ {
-		if errGT == nil {
-			_ = e.write(reqGwToTarget)
-		}
-		if errGR == nil {
-			_ = e.write(repGwToTarget)
-		}
-		if errTT == nil {
-			_ = e.write(reqTargetToGw)
-		}
-		if errTR == nil {
-			_ = e.write(repTargetToGw)
-		}
-		if errG1 == nil {
-			_ = e.write(garpGw)
-		}
-		if errG2 == nil {
-			_ = e.write(garpTarget)
-		}
+		send(reqGwToTarget, errGT)
+		send(repGwToTarget, errGR)
+		send(reqTargetToGw, errTT)
+		send(repTargetToGw, errTR)
+		send(garpGw, errG1)
+		send(garpTarget, errG2)
 		time.Sleep(100 * time.Millisecond)
+	}
+	if writeErrs > 0 {
+		log.Printf("arpengine: corrective burst for %s had %d write failures (last: %v) — target may stay poisoned until its ARP cache expires",
+			t.MAC, writeErrs, lastErr)
 	}
 	return nil
 }
