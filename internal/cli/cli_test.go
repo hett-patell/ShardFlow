@@ -18,6 +18,23 @@ func TestRootCommandHasExpectedSubcommands(t *testing.T) {
 	}
 }
 
+func TestDashIfEmpty(t *testing.T) {
+	assert.Equal(t, "—", dashIfEmpty(""))
+	assert.Equal(t, "Apple", dashIfEmpty("Apple"))
+}
+
+func TestTruncStr(t *testing.T) {
+	// Short strings pass through.
+	assert.Equal(t, "short", truncStr("short", 10))
+	// Equal-length strings pass through (no need for ellipsis).
+	assert.Equal(t, "1234567890", truncStr("1234567890", 10))
+	// Over-long strings get ellipsis (truncStr counts the ellipsis as
+	// 1 visible cell, so n=10 yields 9 chars + "…").
+	assert.Equal(t, "123456789…", truncStr("1234567890ABC", 10))
+	// Pathological n<=1 returns input unchanged (defensive).
+	assert.Equal(t, "hello", truncStr("hello", 1))
+}
+
 func TestParseRate(t *testing.T) {
 	cases := []struct {
 		in        string
