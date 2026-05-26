@@ -89,6 +89,47 @@ func TestStartPrebuildsCadenceFrames(t *testing.T) {
 	assert.Equal(t, uint16(layers.ARPReply), parseOp(r.poisonGwRep))
 }
 
+// TestStartConcurrentWithCloseIsRaceFree validates that the `closed`
+// field is properly synchronised: Close writes it (under handleMu),
+// Start reads it (under e.mu). With a plain bool and two different
+// mutexes this is a data race; the race detector flags it. The fix
+// (atomic.Bool) is asymmetric-mutex-friendly. Run as -race regression.
+//
+// Without the fix, this test fails under `go test -race` with
+// "DATA RACE" on the closed field. Skipped on hosts without CAP_NET_RAW.
+func TestStartConcurrentWithCloseIsRaceFree(t *testing.T) {
+	opMAC, _ := net.ParseMAC("aa:bb:cc:dd:ee:01")
+	e, err := New("lo", opMAC, time.Hour)
+	if err != nil {
+		t.Skipf("pcap.OpenLive(lo) failed (likely missing CAP_NET_RAW in test env): %v", err)
+	}
+
+	tgt := Target{
+		MAC:   mustMAC(t, "77:88:99:aa:bb:cc"),
+		IP:    net.ParseIP("10.0.0.42").To4(),
+		GwMAC: mustMAC(t, "11:22:33:44:55:66"),
+		GwIP:  net.ParseIP("10.0.0.1").To4(),
+	}
+
+	// Race: one goroutine repeatedly Start/Stops, another Closes mid-run.
+	// The race detector instruments every read/write on `closed`; a
+	// single unprotected access in either path is enough to fail.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 20; i++ {
+			_ = e.Start(tgt)
+			_ = e.Stop(tgt)
+		}
+	}()
+	// Sleep is a deliberate jitter — too short and the Close lands
+	// before any Start; too long and the loop above finishes first and
+	// there's no race window.
+	time.Sleep(time.Microsecond)
+	_ = e.Close()
+	<-done
+}
+
 func mustMAC(t *testing.T, s string) net.HardwareAddr {
 	t.Helper()
 	m, err := net.ParseMAC(s)

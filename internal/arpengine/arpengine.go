@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket/pcap"
@@ -50,7 +51,14 @@ type Engine struct {
 
 	mu     sync.Mutex
 	active map[string]*runner // key: TargetMAC.String()
-	closed bool
+
+	// closed is read by Start (under e.mu) and written by Close (under
+	// handleMu). Two different mutexes → can't synchronise via either.
+	// Use atomic so Start's "is the engine still alive?" check works
+	// without acquiring handleMu (which would inverse-nest with e.mu
+	// vs the order Stop uses). Race detector validated by
+	// TestStartConcurrentWithCloseIsRaceFree.
+	closed atomic.Bool
 }
 
 type runner struct {
@@ -126,7 +134,7 @@ func (e *Engine) Close() error {
 	}
 	e.handle.Close()
 	e.handle = nil
-	e.closed = true
+	e.closed.Store(true)
 	return nil
 }
 
@@ -166,7 +174,7 @@ func (e *Engine) WriteFrame(buf []byte) error {
 func (e *Engine) Start(t Target) error {
 	key := t.MAC.String()
 	e.mu.Lock()
-	if e.closed {
+	if e.closed.Load() {
 		e.mu.Unlock()
 		return errors.New("arpengine: closed")
 	}
