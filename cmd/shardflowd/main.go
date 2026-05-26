@@ -394,12 +394,25 @@ func run() (err error) {
 		t := time.NewTicker(time.Minute)
 		defer t.Stop()
 		const deviceTTL = 30 * time.Minute
+		// hasPolicy gives Evict authoritative policy state — the
+		// compiler.Snapshot is the source of truth (nothing populates
+		// the prior store-side Policy field). Without this, a target
+		// under active drop/throttle/pcap that goes idle for >TTL
+		// would be evicted from the device map (TUI row vanishes,
+		// ResolveIP starts failing for the policy command) while the
+		// poison goroutine keeps running — a confusing operational
+		// state. Snapshot is locked internally; safe to call from the
+		// closure even while Evict holds the store lock.
+		hasPolicy := func(mac string) bool {
+			_, ok := comp.Snapshot()[mac]
+			return ok
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				_ = store.Evict(time.Now(), deviceTTL)
+				_ = store.Evict(time.Now(), deviceTTL, hasPolicy)
 			}
 		}
 	}()

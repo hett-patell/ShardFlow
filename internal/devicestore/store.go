@@ -26,8 +26,6 @@ type Device struct {
 	Vendor   string
 	Model    string
 	LastSeen time.Time
-	// Policy is set by policycompiler; nil means "no policy".
-	Policy any // typed by callers; the store doesn't interpret it
 }
 
 // Observation is one fact about a device, fed in by a scanner.
@@ -203,30 +201,6 @@ func (s *Store) List() []Device {
 	return out
 }
 
-// SetPolicy updates the typed-as-any policy field for a known MAC.
-// Returns false if the MAC is unknown.
-//
-// Earlier versions spawned a goroutine for each broadcast (`go
-// s.broadcast(...)`) to avoid holding s.mu across subscriber sends.
-// That created an unbounded goroutine spawn rate under sustained
-// policy churn. broadcast itself uses non-blocking sends per
-// subscriber (trySend), so calling it inline can never block on a
-// slow consumer — we just need to release s.mu before taking
-// s.subsMu.
-func (s *Store) SetPolicy(m net.HardwareAddr, p any) bool {
-	s.mu.Lock()
-	d, ok := s.byMAC[m.String()]
-	if !ok {
-		s.mu.Unlock()
-		return false
-	}
-	d.Policy = p
-	snapshot := copyDevice(*d)
-	s.mu.Unlock()
-	s.broadcast(Event{Kind: EventUpdated, Device: snapshot})
-	return true
-}
-
 // Subscribe returns a channel that receives every event. Buffer size 64.
 // When a slow consumer's buffer fills, the newest incoming event is
 // dropped. Caller MUST call Unsubscribe with the returned channel when
@@ -271,11 +245,21 @@ func (s *Store) broadcast(e Event) {
 // enough that other writers can make progress.
 const evictBatchSize = 256
 
-// Evict removes every device whose LastSeen is older than now-ttl. A
+// Evict removes every device whose LastSeen is older than now-ttl,
+// EXCEPT devices for which hasPolicy(mac.String()) returns true. A
 // device with an active policy is preserved regardless of ttl: the
 // poison/throttle/pcap path holds the canonical reference and we don't
 // want to silently drop a target the operator is actively manipulating.
 // Returns the number of devices evicted.
+//
+// hasPolicy may be nil — equivalent to "no device has a policy",
+// useful for tests and for the rare daemon that runs without a
+// policycompiler. Production daemons pass a closure over
+// compiler.Snapshot() so the eviction guard reflects authoritative
+// policy state. (Earlier versions stored policy state on the Device
+// itself via SetPolicy, but nothing in production wired SetPolicy up,
+// so the guard was effectively dead and policied-but-idle devices
+// could be silently evicted while their poison kept running.)
 //
 // Intended to be called periodically (e.g. once a minute) by the daemon
 // so the device map doesn't grow unbounded on long-running sessions —
@@ -288,7 +272,11 @@ const evictBatchSize = 256
 // Subscribers receive evicted events as each batch completes — not
 // all-at-once at the end — so a slow consumer sees the eviction stream
 // promptly even when N is large.
-func (s *Store) Evict(now time.Time, ttl time.Duration) int {
+//
+// hasPolicy is called while s.mu is held — it must not call back into
+// the store (re-entrant lock would deadlock). The compiler's Snapshot
+// is independently locked and safe to call from here.
+func (s *Store) Evict(now time.Time, ttl time.Duration, hasPolicy func(mac string) bool) int {
 	if ttl <= 0 {
 		return 0
 	}
@@ -299,7 +287,7 @@ func (s *Store) Evict(now time.Time, ttl time.Duration) int {
 		batch = batch[:0]
 		s.mu.Lock()
 		for k, d := range s.byMAC {
-			if d.Policy != nil {
+			if hasPolicy != nil && hasPolicy(k) {
 				continue
 			}
 			if d.LastSeen.IsZero() || d.LastSeen.After(cutoff) {

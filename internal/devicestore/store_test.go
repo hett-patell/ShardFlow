@@ -84,12 +84,6 @@ func TestList(t *testing.T) {
 	assert.Len(t, s.List(), 2)
 }
 
-func TestSetPolicyUnknownMAC(t *testing.T) {
-	s := New()
-	ok := s.SetPolicy(mac("aa:bb:cc:dd:ee:99"), "drop")
-	assert.False(t, ok)
-}
-
 func TestEvictDropsStaleDevicesAndPreservesPolicied(t *testing.T) {
 	s := New()
 	now := time.Now()
@@ -100,11 +94,14 @@ func TestEvictDropsStaleDevicesAndPreservesPolicied(t *testing.T) {
 	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:01"), IP: net.ParseIP("10.0.0.10"), Seen: old})
 	// Stale device WITH a policy → must survive (operator owns it).
 	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:02"), IP: net.ParseIP("10.0.0.11"), Seen: old})
-	require.True(t, s.SetPolicy(mac("aa:bb:cc:dd:ee:02"), "drop"))
 	// Fresh device → must survive regardless of policy.
 	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:03"), IP: net.ParseIP("10.0.0.12"), Seen: fresh})
 
-	n := s.Evict(now, time.Hour)
+	// Predicate models the production wiring (compiler.Snapshot lookup):
+	// device :02 has a policy in the compiler's view, the others don't.
+	hasPolicy := func(m string) bool { return m == "aa:bb:cc:dd:ee:02" }
+
+	n := s.Evict(now, time.Hour, hasPolicy)
 	assert.Equal(t, 1, n, "exactly the stale-no-policy device must be evicted")
 
 	_, ok := s.Get(mac("aa:bb:cc:dd:ee:01"))
@@ -117,6 +114,24 @@ func TestEvictDropsStaleDevicesAndPreservesPolicied(t *testing.T) {
 	// byIP must stay in sync with byMAC after eviction.
 	_, ok = s.ResolveIP(net.ParseIP("10.0.0.10"))
 	assert.False(t, ok, "byIP entry for evicted device must also be cleared")
+}
+
+// TestEvictNilPredicateEvictsEveryStale documents the contract for
+// hasPolicy == nil: equivalent to "no device has a policy", so every
+// stale device is evicted regardless of how the daemon would have
+// answered. Tests and CI rigs that don't run a policycompiler can pass
+// nil and get the legacy behaviour.
+func TestEvictNilPredicateEvictsEveryStale(t *testing.T) {
+	s := New()
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+
+	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:01"), Seen: old})
+	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:02"), Seen: old})
+
+	n := s.Evict(now, time.Hour, nil)
+	assert.Equal(t, 2, n, "with nil predicate, every stale device is evicted")
+	assert.Empty(t, s.List())
 }
 
 // TestEvictBatchesLargeSweep verifies that Evict against a store with
@@ -139,7 +154,7 @@ func TestEvictBatchesLargeSweep(t *testing.T) {
 		s.Upsert(Observation{MAC: m, IP: net.IPv4(10, 0, byte(i>>8), byte(i)), Seen: old})
 	}
 
-	got := s.Evict(now, time.Hour)
+	got := s.Evict(now, time.Hour, nil)
 	assert.Equal(t, n, got, "Evict must return total across batches")
 	assert.Empty(t, s.List(), "store must be empty after sweep")
 }
@@ -195,7 +210,7 @@ func TestEvictStreamsEventsAcrossBatches(t *testing.T) {
 		}
 	}()
 
-	got := s.Evict(now, time.Hour)
+	got := s.Evict(now, time.Hour, nil)
 	// Snapshot how many events the drainer saw before Evict returned.
 	// A non-streaming implementation buffers everything and only
 	// broadcasts after Evict's loop exits — so the drainer would see 0.
@@ -239,7 +254,7 @@ func TestEvictAllowsConcurrentUpsertBetweenBatches(t *testing.T) {
 		close(done)
 	}()
 
-	got := s.Evict(now, time.Hour)
+	got := s.Evict(now, time.Hour, nil)
 	<-done
 
 	assert.Equal(t, n, got, "all stale devices evicted")
@@ -270,7 +285,7 @@ func TestEvictPreservesByIPWhenIPReassigned(t *testing.T) {
 	assert.Equal(t, "aa:bb:cc:dd:ee:02", got.String(), "byIP must point at last writer")
 
 	// Evict A. B must keep its reverse mapping intact.
-	n := s.Evict(now, time.Hour)
+	n := s.Evict(now, time.Hour, nil)
 	assert.Equal(t, 1, n, "exactly A should be evicted")
 
 	got, ok = s.ResolveIP(ip)
@@ -302,28 +317,4 @@ func TestUpsertPreservesByIPWhenIPReassigned(t *testing.T) {
 	assert.Equal(t, "aa:bb:cc:dd:ee:01", got.String())
 }
 
-func TestSetPolicyKnownMACBroadcastsUpdate(t *testing.T) {
-	s := New()
-	ch := s.Subscribe()
-	t.Cleanup(func() { s.Unsubscribe(ch) })
-	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:01"), IP: net.ParseIP("10.0.0.42")})
 
-	// Drain the discovery event from the Upsert above.
-	<-ch
-
-	ok := s.SetPolicy(mac("aa:bb:cc:dd:ee:01"), "drop")
-	require.True(t, ok)
-
-	// SetPolicy broadcasts asynchronously (`go s.broadcast(...)`); allow
-	// up to a second for the event to land.
-	select {
-	case e := <-ch:
-		assert.Equal(t, EventUpdated, e.Kind)
-		assert.Equal(t, "drop", e.Device.Policy)
-	case <-time.After(time.Second):
-		t.Fatal("expected updated event after SetPolicy")
-	}
-
-	d, _ := s.Get(mac("aa:bb:cc:dd:ee:01"))
-	assert.Equal(t, "drop", d.Policy)
-}
