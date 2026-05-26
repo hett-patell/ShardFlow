@@ -250,6 +250,18 @@ func (s *Store) broadcast(e Event) {
 	}
 }
 
+// evictBatchSize caps how many devices Evict removes under a single
+// s.mu.Lock acquisition before releasing and broadcasting. On a Wi-Fi
+// sniff capturing privacy-randomised MACs at a busy venue (coffee shop,
+// conference) the store can accumulate thousands of stale entries
+// between TTL sweeps; processing them all under one lock would (a) pin
+// the write lock for the entire scan + N copyDevice allocations, and
+// (b) hold off any concurrent Upsert from the passive sniffer for the
+// duration. 256 is large enough to keep amortised cost low (~4-8 sweeps
+// to clean a typical accumulation) while keeping each lock hold short
+// enough that other writers can make progress.
+const evictBatchSize = 256
+
 // Evict removes every device whose LastSeen is older than now-ttl. A
 // device with an active policy is preserved regardless of ttl: the
 // poison/throttle/pcap path holds the canonical reference and we don't
@@ -260,29 +272,52 @@ func (s *Store) broadcast(e Event) {
 // so the device map doesn't grow unbounded on long-running sessions —
 // roaming guests with privacy-randomised MACs, IoT devices that come and
 // go, etc.
+//
+// Processes the sweep in batches of evictBatchSize to bound the
+// worst-case lock-hold time: between batches the write lock is
+// released so Upserts from the passive sniffer can interleave.
+// Subscribers receive evicted events as each batch completes — not
+// all-at-once at the end — so a slow consumer sees the eviction stream
+// promptly even when N is large.
 func (s *Store) Evict(now time.Time, ttl time.Duration) int {
 	if ttl <= 0 {
 		return 0
 	}
 	cutoff := now.Add(-ttl)
-	s.mu.Lock()
-	var evicted []Device
-	for k, d := range s.byMAC {
-		if d.Policy != nil {
-			continue
+	total := 0
+	batch := make([]Device, 0, evictBatchSize)
+	for {
+		batch = batch[:0]
+		s.mu.Lock()
+		for k, d := range s.byMAC {
+			if d.Policy != nil {
+				continue
+			}
+			if d.LastSeen.IsZero() || d.LastSeen.After(cutoff) {
+				continue
+			}
+			if d.IP != nil {
+				delete(s.byIP, d.IP.String())
+			}
+			delete(s.byMAC, k)
+			batch = append(batch, copyDevice(*d))
+			if len(batch) >= evictBatchSize {
+				break
+			}
 		}
-		if d.LastSeen.IsZero() || d.LastSeen.After(cutoff) {
-			continue
+		s.mu.Unlock()
+		if len(batch) == 0 {
+			return total
 		}
-		if d.IP != nil {
-			delete(s.byIP, d.IP.String())
+		for _, d := range batch {
+			s.broadcast(Event{Kind: EventEvicted, Device: d})
 		}
-		delete(s.byMAC, k)
-		evicted = append(evicted, copyDevice(*d))
+		total += len(batch)
+		// If we filled the batch, there may be more — go around again.
+		// If we didn't fill it, the map is exhausted and the next
+		// iteration will exit via the len==0 check.
+		if len(batch) < evictBatchSize {
+			return total
+		}
 	}
-	s.mu.Unlock()
-	for _, d := range evicted {
-		s.broadcast(Event{Kind: EventEvicted, Device: d})
-	}
-	return len(evicted)
 }

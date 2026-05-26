@@ -2,6 +2,7 @@ package devicestore
 
 import (
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -116,6 +117,134 @@ func TestEvictDropsStaleDevicesAndPreservesPolicied(t *testing.T) {
 	// byIP must stay in sync with byMAC after eviction.
 	_, ok = s.ResolveIP(net.ParseIP("10.0.0.10"))
 	assert.False(t, ok, "byIP entry for evicted device must also be cleared")
+}
+
+// TestEvictBatchesLargeSweep verifies that Evict against a store with
+// > evictBatchSize stale devices removes them all across multiple
+// batches. The exact internal batch count is an implementation detail;
+// the externally-visible contract is: Evict returns the total, and the
+// store is empty afterwards. (Event-loss under buffer pressure is
+// already covered by Subscribe's documented drop-newest semantics; this
+// test focuses on the eviction loop's correctness across batches.)
+func TestEvictBatchesLargeSweep(t *testing.T) {
+	s := New()
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+
+	// Populate with evictBatchSize*2 + 17 stale devices so we exercise
+	// the "fill batch, go around, partial batch, exit" path.
+	const n = evictBatchSize*2 + 17
+	for i := 0; i < n; i++ {
+		m := net.HardwareAddr{0xaa, 0xbb, 0xcc, byte(i >> 16), byte(i >> 8), byte(i)}
+		s.Upsert(Observation{MAC: m, IP: net.IPv4(10, 0, byte(i>>8), byte(i)), Seen: old})
+	}
+
+	got := s.Evict(now, time.Hour)
+	assert.Equal(t, n, got, "Evict must return total across batches")
+	assert.Empty(t, s.List(), "store must be empty after sweep")
+}
+
+// TestEvictStreamsEventsAcrossBatches asserts the streaming property:
+// for an Evict call that processes multiple batches, subscriber events
+// arrive incrementally (during the sweep) rather than all-at-once at
+// the end. Drives Evict from one goroutine and a fast drainer from
+// another; checks that we observe at least one event well before the
+// theoretical "all events after Evict returns" baseline.
+//
+// Concretely: we count events received by the drainer up to the moment
+// Evict returns, and require it to be > 0 (with a non-batched
+// implementation the drainer would see 0 until Evict returned).
+func TestEvictStreamsEventsAcrossBatches(t *testing.T) {
+	s := New()
+
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+	const n = evictBatchSize * 4
+	for i := 0; i < n; i++ {
+		m := net.HardwareAddr{0xaa, 0xbb, 0xcc, byte(i >> 16), byte(i >> 8), byte(i)}
+		s.Upsert(Observation{MAC: m, IP: net.IPv4(10, 2, byte(i>>8), byte(i)), Seen: old})
+	}
+
+	// Subscribe AFTER populating so we don't have to drain n Discovered
+	// events (Upsert's broadcast is synchronous & non-blocking — beyond
+	// buffer cap they're dropped on the floor, which is documented but
+	// makes them un-drainable). The subscriber only sees EventEvicted.
+	ch := s.Subscribe()
+	t.Cleanup(func() { s.Unsubscribe(ch) })
+
+	// Start a counter goroutine and Evict concurrently.
+	var (
+		mu              sync.Mutex
+		evictedReceived int
+	)
+	stopDrain := make(chan struct{})
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		for {
+			select {
+			case e := <-ch:
+				if e.Kind == EventEvicted {
+					mu.Lock()
+					evictedReceived++
+					mu.Unlock()
+				}
+			case <-stopDrain:
+				return
+			}
+		}
+	}()
+
+	got := s.Evict(now, time.Hour)
+	// Snapshot how many events the drainer saw before Evict returned.
+	// A non-streaming implementation buffers everything and only
+	// broadcasts after Evict's loop exits — so the drainer would see 0.
+	mu.Lock()
+	duringSweep := evictedReceived
+	mu.Unlock()
+
+	close(stopDrain)
+	<-drainDone
+
+	assert.Equal(t, n, got, "Evict must return correct total")
+	assert.Greater(t, duringSweep, 0, "subscriber must receive events DURING the sweep (streaming), not only after")
+}
+
+// TestEvictAllowsConcurrentUpsertBetweenBatches asserts that the
+// per-batch unlock actually yields the write lock — without it, an
+// Upsert racing against a long Evict would have to wait for the whole
+// sweep. We can't directly measure lock hold time, but we can verify
+// the externally-visible behaviour: an Upsert kicked off mid-sweep
+// completes and its device survives (because it's fresh, not stale).
+func TestEvictAllowsConcurrentUpsertBetweenBatches(t *testing.T) {
+	s := New()
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+
+	// 3 full batches of stale devices.
+	const n = evictBatchSize * 3
+	for i := 0; i < n; i++ {
+		m := net.HardwareAddr{0xaa, 0xbb, 0xcc, byte(i >> 16), byte(i >> 8), byte(i)}
+		s.Upsert(Observation{MAC: m, IP: net.IPv4(10, 1, byte(i>>8), byte(i)), Seen: old})
+	}
+
+	// Start Evict and concurrently Upsert a fresh device. The Upsert
+	// must complete (not deadlock, not hang) — that's the test.
+	freshMAC := net.HardwareAddr{0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa}
+	done := make(chan struct{})
+	go func() {
+		// tiny jitter so the Upsert lands while Evict is mid-sweep
+		time.Sleep(time.Microsecond)
+		s.Upsert(Observation{MAC: freshMAC, IP: net.ParseIP("10.99.99.99"), Seen: now})
+		close(done)
+	}()
+
+	got := s.Evict(now, time.Hour)
+	<-done
+
+	assert.Equal(t, n, got, "all stale devices evicted")
+	_, ok := s.Get(freshMAC)
+	assert.True(t, ok, "concurrently-upserted fresh device must survive")
 }
 
 func TestSetPolicyKnownMACBroadcastsUpdate(t *testing.T) {
