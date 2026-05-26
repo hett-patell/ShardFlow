@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -33,6 +34,26 @@ func TestTruncStr(t *testing.T) {
 	assert.Equal(t, "123456789…", truncStr("1234567890ABC", 10))
 	// Pathological n<=1 returns input unchanged (defensive).
 	assert.Equal(t, "hello", truncStr("hello", 1))
+}
+
+// TestPrintStatsStableOrder: map iteration order is undefined in Go, so
+// the previous `json.Encode(map[string]any{...})` produced
+// non-deterministic output. printStats sorts keys; verify successive
+// renders of the same map produce byte-identical output and keys
+// appear in alphabetical order.
+func TestPrintStatsStableOrder(t *testing.T) {
+	s := map[string]any{
+		"poisoned": 3,
+		"devices":  42,
+		"policies": 5,
+	}
+	var buf1, buf2 bytes.Buffer
+	printStats(&buf1, s)
+	printStats(&buf2, s)
+	assert.Equal(t, buf1.String(), buf2.String(), "output must be deterministic")
+
+	want := "devices      42\npoisoned     3\npolicies     5\n"
+	assert.Equal(t, want, buf1.String())
 }
 
 func TestParseRate(t *testing.T) {
