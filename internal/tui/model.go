@@ -231,6 +231,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Ctrl+C must quit unconditionally — including from filter
+		// mode, which used to swallow it inside the keystroke switch
+		// below and leave the operator no way out short of Esc-then-q.
+		// Bubble Tea v1 does NOT auto-quit on Ctrl+C, so we handle it
+		// explicitly here, above every other key dispatch.
+		if msg.Type == tea.KeyCtrlC {
+			return m, tea.Quit
+		}
+
 		// Filter-mode input intercepts most keys: characters extend
 		// the filter, backspace shortens, Enter/Esc commit/clear.
 		// Action keys (D/T/P/S/Q etc.) are intentionally NOT consumed

@@ -30,6 +30,34 @@ func TestModelHandlesQuit(t *testing.T) {
 	assert.NotNil(t, cmd)
 }
 
+// TestCtrlCQuitsFromAnyState guards a real usability bug: in v1, the
+// filter-mode branch of Update returned (m, nil) for any key it didn't
+// recognise — including Ctrl+C — leaving the operator with no quit
+// keystroke until they pressed Esc to drop filter mode first. Now
+// Ctrl+C is handled at the top of the KeyMsg switch and works from
+// every state.
+func TestCtrlCQuitsFromAnyState(t *testing.T) {
+	// From nav mode.
+	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	assert.NotNil(t, cmd, "Ctrl+C must return a quit command from nav mode")
+
+	// From filter mode (the original bug).
+	m = newModel(nil, 200, "/var/lib/shardflow/pcap")
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	if !assert.True(t, m.filterMode, "precondition: must be in filter mode") {
+		return
+	}
+	_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	assert.NotNil(t, cmd, "Ctrl+C must return a quit command from filter mode")
+
+	// From help overlay.
+	m = newModel(nil, 200, "/var/lib/shardflow/pcap")
+	m.showHelp = true
+	_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	assert.NotNil(t, cmd, "Ctrl+C must return a quit command with help overlay open")
+}
+
 func TestModelMovesSelectionDownUp(t *testing.T) {
 	m := newModel(nil, 200, "/var/lib/shardflow/pcap")
 	m.devices = []deviceRow{{ip: "10.0.0.42"}, {ip: "10.0.0.55"}}
