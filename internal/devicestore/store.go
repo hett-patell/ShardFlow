@@ -124,8 +124,17 @@ func (s *Store) Upsert(o Observation) {
 		// Keep byIP in sync: drop the old reverse entry, install the new.
 		// Two MACs claiming the same IP can happen on misconfigured LANs;
 		// last writer wins, matching the byMAC behaviour above.
+		//
+		// Ownership check on the delete: if a prior Upsert by another
+		// MAC already reassigned byIP[d.IP] away from us, we must NOT
+		// delete that entry — it now belongs to the other MAC.
+		// Without this guard, two devices alternating between the same
+		// two IPs would chew through each other's reverse mappings.
 		if existed && d.IP != nil {
-			delete(s.byIP, d.IP.String())
+			ipKey := d.IP.String()
+			if owner, ok := s.byIP[ipKey]; ok && owner == key {
+				delete(s.byIP, ipKey)
+			}
 		}
 		d.IP = append(net.IP{}, o.IP...)
 		s.byIP[d.IP.String()] = key
@@ -297,7 +306,18 @@ func (s *Store) Evict(now time.Time, ttl time.Duration) int {
 				continue
 			}
 			if d.IP != nil {
-				delete(s.byIP, d.IP.String())
+				// Ownership check: byIP[ip] may have been reassigned
+				// to a different MAC by a later Upsert (two devices
+				// claiming the same IP — misconfig, DHCP race, or a
+				// poisoned ARP we just observed back from a target).
+				// Only clear the reverse entry if it still points at
+				// US; otherwise we'd silently drop another live
+				// device's IP→MAC mapping and ResolveIP would start
+				// returning false for an IP that's still in use.
+				ipKey := d.IP.String()
+				if owner, ok := s.byIP[ipKey]; ok && owner == k {
+					delete(s.byIP, ipKey)
+				}
 			}
 			delete(s.byMAC, k)
 			batch = append(batch, copyDevice(*d))

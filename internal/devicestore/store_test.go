@@ -247,6 +247,61 @@ func TestEvictAllowsConcurrentUpsertBetweenBatches(t *testing.T) {
 	assert.True(t, ok, "concurrently-upserted fresh device must survive")
 }
 
+// TestEvictPreservesByIPWhenIPReassigned guards against a real
+// data-loss bug: device A claims IP X, then device B claims IP X (last
+// writer wins on byIP), then A is evicted by TTL. The old code blindly
+// did delete(byIP, X) on A's eviction, wiping B's reverse mapping even
+// though B is still alive — ResolveIP(X) then returned false for an IP
+// that's clearly in use.
+func TestEvictPreservesByIPWhenIPReassigned(t *testing.T) {
+	s := New()
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+	ip := net.ParseIP("10.0.0.42")
+
+	// A: stale (will be evicted), claims IP first.
+	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:01"), IP: ip, Seen: old})
+	// B: fresh, claims the SAME IP (DHCP race, ARP spoof, misconfig).
+	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:02"), IP: ip, Seen: now})
+
+	// Before eviction: byIP must resolve to B (last writer wins).
+	got, ok := s.ResolveIP(ip)
+	require.True(t, ok)
+	assert.Equal(t, "aa:bb:cc:dd:ee:02", got.String(), "byIP must point at last writer")
+
+	// Evict A. B must keep its reverse mapping intact.
+	n := s.Evict(now, time.Hour)
+	assert.Equal(t, 1, n, "exactly A should be evicted")
+
+	got, ok = s.ResolveIP(ip)
+	assert.True(t, ok, "B's IP→MAC mapping must survive A's eviction")
+	if ok {
+		assert.Equal(t, "aa:bb:cc:dd:ee:02", got.String())
+	}
+}
+
+// TestUpsertPreservesByIPWhenIPReassigned: same data-loss class on the
+// Upsert side. If A's IP is reassigned to B, and then A is observed
+// again with a NEW IP, A's old-IP cleanup must not wipe B's entry.
+func TestUpsertPreservesByIPWhenIPReassigned(t *testing.T) {
+	s := New()
+	ip1 := net.ParseIP("10.0.0.42")
+	ip2 := net.ParseIP("10.0.0.43")
+
+	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:01"), IP: ip1}) // A → .42
+	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:02"), IP: ip1}) // B → .42 (steals)
+	s.Upsert(Observation{MAC: mac("aa:bb:cc:dd:ee:01"), IP: ip2}) // A → .43 (cleanup .42)
+
+	// .42 must still resolve to B; .43 must resolve to A.
+	got, ok := s.ResolveIP(ip1)
+	require.True(t, ok, ".42 must remain mapped (to B)")
+	assert.Equal(t, "aa:bb:cc:dd:ee:02", got.String())
+
+	got, ok = s.ResolveIP(ip2)
+	require.True(t, ok, ".43 must be mapped to A")
+	assert.Equal(t, "aa:bb:cc:dd:ee:01", got.String())
+}
+
 func TestSetPolicyKnownMACBroadcastsUpdate(t *testing.T) {
 	s := New()
 	ch := s.Subscribe()
