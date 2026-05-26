@@ -142,6 +142,18 @@ func (e *Engine) write(buf []byte) error {
 	return e.handle.WritePacketData(buf)
 }
 
+// WriteFrame is the exported form of write. Lets other components on the
+// daemon side (active.Sweep, future passive injectors) push frames
+// through the engine's already-open pcap handle instead of opening a
+// second write handle on the same iface — saves a pcap_activate +
+// kernel ring buffer per use site.
+//
+// Concurrency: serialised through handleMu (libpcap's WritePacketData is
+// not goroutine-safe). Returns an error if the engine has been Closed.
+func (e *Engine) WriteFrame(buf []byte) error {
+	return e.write(buf)
+}
+
 // Start begins poisoning t. Idempotent: starting an already-active target
 // is a no-op (returns nil without restarting).
 //

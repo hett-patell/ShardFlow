@@ -258,7 +258,12 @@ func run() (err error) {
 			}
 			store.Upsert(obs)
 		}
-		if err := active.Sweep(actCtx, info.Name, info.HwAddr, info.IP, info.IPNet, 2*time.Second, countObs); err != nil {
+		// Pass arp as the FrameWriter: active.Sweep then uses the
+		// engine's already-open pcap handle for ARP request sends
+		// instead of opening a second write capacity on the same
+		// iface. Also lets the read handle drop promisc mode — replies
+		// to our own ARP arrive at our MAC regardless.
+		if err := active.SweepWithWriter(actCtx, info.Name, info.HwAddr, info.IP, info.IPNet, 2*time.Second, arp, countObs); err != nil {
 			stats.record(len(seen))
 			return err
 		}

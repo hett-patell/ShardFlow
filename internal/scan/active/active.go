@@ -19,6 +19,20 @@ import (
 	"github.com/hett-patell/ShardFlow/internal/oui"
 )
 
+// FrameWriter is the minimal interface Sweep needs for the send side.
+// Implemented by arpengine.Engine.WriteFrame so the daemon can reuse
+// the engine's long-lived pcap handle instead of having Sweep open a
+// second write capacity on the same iface (saves one pcap_activate
+// per scan and lets the read handle drop promisc mode — see Sweep
+// docstring).
+//
+// nil is an acceptable value: Sweep then opens its own read+write
+// handle as the v1 code did, preserving the standalone-test path
+// where there's no arpengine instance to inject.
+type FrameWriter interface {
+	WriteFrame(buf []byte) error
+}
+
 // sendBudget is the wall-clock cap on the ARP send phase. Independent of
 // how many hosts the CIDR contains: on a fast LAN /16 finishes the send
 // phase in ~6.5s with our 100µs pacing, on a contended Wi-Fi link each
@@ -36,8 +50,31 @@ const sendBudget = 3 * time.Second
 // onObs is invoked from a dedicated listener goroutine; it must be safe
 // for concurrent use. Sweep returns only after the listener goroutine has
 // exited, so onObs is never called after Sweep returns.
+//
+// Opens its own read+write pcap handle. Callers that already have a
+// long-lived write handle (the daemon's arpengine) should prefer
+// SweepWithWriter to share that handle and avoid a second pcap_activate
+// on the same iface.
 func Sweep(ctx context.Context, ifaceName string, srcMAC net.HardwareAddr, srcIP net.IP, cidr *net.IPNet, window time.Duration, onObs func(devicestore.Observation)) error {
-	handle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
+	return SweepWithWriter(ctx, ifaceName, srcMAC, srcIP, cidr, window, nil, onObs)
+}
+
+// SweepWithWriter is Sweep with an injected FrameWriter for the send
+// path. When writer != nil:
+//
+//   - the read handle is opened with promisc=false (we only need replies
+//     to our own ARP, which arrive at our MAC regardless of promisc —
+//     dropping promisc avoids the driver's monitor-adjacent state on
+//     Wi-Fi and removes a class of per-frame kernel work)
+//   - frames are sent through writer.WriteFrame (the engine's shared
+//     handle) instead of the local read-handle's WritePacketData
+//
+// When writer is nil: behaves identically to v1 Sweep — opens a single
+// promiscuous handle and uses it for both directions. This preserves
+// the standalone-test path where there is no arpengine to inject.
+func SweepWithWriter(ctx context.Context, ifaceName string, srcMAC net.HardwareAddr, srcIP net.IP, cidr *net.IPNet, window time.Duration, writer FrameWriter, onObs func(devicestore.Observation)) error {
+	promisc := writer == nil // see SweepWithWriter docstring for rationale
+	handle, err := pcap.OpenLive(ifaceName, 65536, promisc, pcap.BlockForever)
 	if err != nil {
 		return fmt.Errorf("pcap open %s: %w", ifaceName, err)
 	}
@@ -152,8 +189,14 @@ func Sweep(ctx context.Context, ifaceName string, srcMAC net.HardwareAddr, srcIP
 			continue
 		}
 		copy(frame[dstIPOffset:dstIPOffset+4], ip4)
-		if err := handle.WritePacketData(frame); err != nil {
-			return fmt.Errorf("send: %w", err)
+		var werr error
+		if writer != nil {
+			werr = writer.WriteFrame(frame)
+		} else {
+			werr = handle.WritePacketData(frame)
+		}
+		if werr != nil {
+			return fmt.Errorf("send: %w", werr)
 		}
 		sent++
 		if pacingDelay > 0 {
