@@ -19,9 +19,17 @@ func argvEnsureDropTable() []string {
 	return []string{"add", "table", dropTableFamily, dropTableName}
 }
 
-func argvAddDropRule(targetMAC net.HardwareAddr) []string {
+// argvAddDropRuleEgress blocks outgoing traffic FROM the target (victim → gateway).
+func argvAddDropRuleEgress(targetMAC net.HardwareAddr) []string {
 	return []string{"add", "rule", dropTableFamily, dropTableName, dropChainName,
 		"ether", "saddr", targetMAC.String(), "drop",
+		"comment", `"` + commentTagFor(targetMAC) + `"`}
+}
+
+// argvAddDropRuleIngress blocks incoming traffic TO the target (gateway → victim).
+func argvAddDropRuleIngress(targetMAC net.HardwareAddr) []string {
+	return []string{"add", "rule", dropTableFamily, dropTableName, dropChainName,
+		"ether", "daddr", targetMAC.String(), "drop",
 		"comment", `"` + commentTagFor(targetMAC) + `"`}
 }
 

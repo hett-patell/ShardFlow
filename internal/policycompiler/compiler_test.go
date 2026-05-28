@@ -90,7 +90,7 @@ func (f *fakeARP) StopAll() error { f.calls = append(f.calls, "StopAll"); return
 func TestApplyDropFromEmpty(t *testing.T) {
 	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:01")
 	nft, tc, pc, arp := &fakeNFT{}, &fakeTC{}, &fakePcap{}, &fakeARP{}
-	c := New(nft, tc, pc, arp, "eth0")
+	c := New(nft, tc, pc, arp, "eth0", nil)
 
 	desired := map[string]Spec{
 		mac.String(): {Target: arpengine.Target{MAC: mac, IP: net.ParseIP("10.0.0.42"), GwMAC: nil, GwIP: net.ParseIP("10.0.0.1")}, Kind: KindDrop},
@@ -106,7 +106,7 @@ func TestApplyDropFromEmpty(t *testing.T) {
 func TestApplyThrottleSequence(t *testing.T) {
 	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:02")
 	nft, tc, pc, arp := &fakeNFT{}, &fakeTC{}, &fakePcap{}, &fakeARP{}
-	c := New(nft, tc, pc, arp, "eth0")
+	c := New(nft, tc, pc, arp, "eth0", nil)
 
 	desired := map[string]Spec{
 		mac.String(): {Target: arpengine.Target{MAC: mac}, Kind: KindThrottle, RateKbit: 200},
@@ -116,14 +116,15 @@ func TestApplyThrottleSequence(t *testing.T) {
 	// nft is no longer in the throttle path (tc-flower matches src_mac
 	// directly without an nft-mark intermediary; see compiler comment).
 	assert.Empty(t, nft.calls)
-	assert.Equal(t, fmt.Sprintf("SetThrottle:%s:200kbit:11", mac.String()), tc.calls[0])
+	// Mark 11 is allocated (nextMark starts at 10, first alloc is 11).
+	assert.Contains(t, tc.calls[0], "SetThrottle:"+mac.String()+":200kbit:11")
 	assert.Equal(t, "Start:"+mac.String(), arp.calls[0])
 }
 
 func TestApplyTransitionDropToThrottleTearsDownThenBringsUp(t *testing.T) {
 	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:03")
 	nft, tc, pc, arp := &fakeNFT{}, &fakeTC{}, &fakePcap{}, &fakeARP{}
-	c := New(nft, tc, pc, arp, "eth0")
+	c := New(nft, tc, pc, arp, "eth0", nil)
 
 	require.NoError(t, c.Apply(context.Background(), map[string]Spec{
 		mac.String(): {Target: arpengine.Target{MAC: mac}, Kind: KindDrop},
@@ -204,7 +205,7 @@ func (f *safeARP) StopAll() error { return nil }
 func TestApplyTearsDownInParallel(t *testing.T) {
 	nft := &slowSafeNFT{removeDel: 200 * time.Millisecond}
 	tc, pc, arp := &fakeTC{}, &fakePcap{}, &safeARP{}
-	c := New(nft, tc, pc, arp, "eth0")
+	c := New(nft, tc, pc, arp, "eth0", nil)
 
 	// Bring up 4 drop policies.
 	desired := map[string]Spec{}
@@ -242,7 +243,7 @@ func TestApplyTearsDownInParallel(t *testing.T) {
 func TestSnapshotDeepCopiesTargetSlices(t *testing.T) {
 	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:04")
 	nft, tc, pc, arp := &fakeNFT{}, &fakeTC{}, &fakePcap{}, &fakeARP{}
-	c := New(nft, tc, pc, arp, "eth0")
+	c := New(nft, tc, pc, arp, "eth0", nil)
 
 	require.NoError(t, c.Apply(context.Background(), map[string]Spec{
 		mac.String(): {Target: arpengine.Target{
@@ -263,4 +264,28 @@ func TestSnapshotDeepCopiesTargetSlices(t *testing.T) {
 	again := c.Snapshot()[mac.String()]
 	assert.Equal(t, "10.0.0.42", again.Target.IP.String(), "Snapshot must deep-copy Target.IP")
 	assert.Equal(t, "11:22:33:44:55:66", again.Target.GwMAC.String(), "Snapshot must deep-copy Target.GwMAC")
+}
+
+func TestApplyRejectsSelfMAC(t *testing.T) {
+	operatorMAC, _ := net.ParseMAC("aa:bb:cc:dd:ee:99")
+	nft, tc, pc, arp := &fakeNFT{}, &fakeTC{}, &fakePcap{}, &fakeARP{}
+	c := New(nft, tc, pc, arp, "eth0", operatorMAC)
+
+	// Attempt to apply a policy targeting the operator's own MAC.
+	desired := map[string]Spec{
+		operatorMAC.String(): {
+			Target: arpengine.Target{
+				MAC: operatorMAC,
+				IP:  net.ParseIP("10.0.0.99").To4(),
+			},
+			Kind: KindDrop,
+		},
+	}
+	err := c.Apply(context.Background(), desired)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "self-DoS protection")
+	// No effector calls should have been made.
+	assert.Empty(t, nft.calls)
+	assert.Empty(t, tc.calls)
+	assert.Empty(t, arp.calls)
 }

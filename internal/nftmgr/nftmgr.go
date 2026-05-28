@@ -98,8 +98,18 @@ add chain netdev %s %s { type filter hook ingress device %s priority 0; policy a
 }
 
 func (m *Manager) AddTargetDrop(ctx context.Context, mac net.HardwareAddr) error {
-	_, err := m.r.Run(ctx, argvAddDropRule(mac))
-	return err
+	// Add egress rule: blocks traffic FROM victim (victim → gateway)
+	if _, err := m.r.Run(ctx, argvAddDropRuleEgress(mac)); err != nil {
+		return fmt.Errorf("add egress drop rule: %w", err)
+	}
+	// Add ingress rule: blocks traffic TO victim (gateway → victim)
+	if _, err := m.r.Run(ctx, argvAddDropRuleIngress(mac)); err != nil {
+		// Rollback the egress rule we just added. RemoveTarget finds all
+		// rules tagged with this MAC's comment and deletes them.
+		_ = m.RemoveTarget(ctx, mac)
+		return fmt.Errorf("add ingress drop rule: %w", err)
+	}
+	return nil
 }
 
 // AddTargetMark inserts the netdev-ingress rule that sets fwmark on frames

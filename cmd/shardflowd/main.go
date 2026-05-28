@@ -69,8 +69,8 @@ func run() (err error) {
 		forceFlag      = flag.Bool("force", false, "remove stale socket if present")
 		cleanFlag      = flag.Bool("clean-on-start", false, "clean orphaned kernel state from a prior run")
 		defaultPcapDir = flag.String("default-pcap-dir", "/var/lib/shardflow/pcap", "directory used by Policy.Set pcap when its pcap_dir is empty")
-		poisonCadence = flag.Duration("poison-cadence", time.Second,
-			"interval between ARP poison bursts per target. Default 1s is reliable for `policy clear` correctives. For stubborn modern phones (iOS 16+, hardened Android) where 1Hz loses the race, dial down to 200ms (≈20 fps) or 50ms (≈80 fps). Each burst sends 4 frames per target.")
+		poisonCadence = flag.Duration("poison-cadence", 200*time.Millisecond,
+			"interval between ARP poison bursts per target. Default 200ms is reliable for modern devices (iOS 16+, Android 12+). For older devices or stealth, use 500ms or 1s. Each burst sends 4 frames per target.")
 		versionFlag = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
@@ -106,14 +106,15 @@ func run() (err error) {
 		_, _ = setIPv4Forward(prevForward)
 	}()
 
-	fmt.Fprintln(os.Stderr, "shardflowd: disable ICMP send_redirects")
-	prevRedirAll, prevRedirIface, err := disableSendRedirects(info.Name)
+	fmt.Fprintln(os.Stderr, "shardflowd: disable ICMP send_redirects (all, default, "+info.Name+")")
+	prevRedir, err := disableSendRedirects(info.Name)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		_, _ = writeSysctl("/proc/sys/net/ipv4/conf/all/send_redirects", prevRedirAll)
-		_, _ = writeSysctl("/proc/sys/net/ipv4/conf/"+info.Name+"/send_redirects", prevRedirIface)
+		_, _ = writeSysctl("/proc/sys/net/ipv4/conf/all/send_redirects", prevRedir.all)
+		_, _ = writeSysctl("/proc/sys/net/ipv4/conf/default/send_redirects", prevRedir.def)
+		_, _ = writeSysctl("/proc/sys/net/ipv4/conf/"+info.Name+"/send_redirects", prevRedir.iface)
 	}()
 
 	// Gateway MAC resolution runs in parallel with nft/tc Ensure* because
@@ -145,7 +146,7 @@ func run() (err error) {
 	}
 	fmt.Fprintf(os.Stderr, "shardflowd: poison cadence = %s (≈ %.0f bursts/sec/target)\n",
 		*poisonCadence, float64(time.Second)/float64(*poisonCadence))
-	comp := policycompiler.New(nft, tcm, pc, arp, info.Name)
+	comp := policycompiler.New(nft, tcm, pc, arp, info.Name, info.HwAddr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -153,6 +154,7 @@ func run() (err error) {
 	var shutdownOnce sync.Once
 	shutdown := func() {
 		shutdownOnce.Do(func() {
+			fmt.Fprintln(os.Stderr, "shardflowd: running cleanup")
 			_ = arp.StopAll()
 			_ = comp.Apply(context.Background(), map[string]policycompiler.Spec{})
 			_ = nft.Teardown(context.Background())
@@ -161,11 +163,8 @@ func run() (err error) {
 			_ = arp.Close() // release shared pcap handle
 		})
 	}
-	defer func() {
-		if err != nil {
-			shutdown()
-		}
-	}()
+	// Unconditional defer so cleanup runs on normal exit, error, AND panic.
+	defer shutdown()
 
 	// Forward-declare srv and deps so the signal handler closure can
 	// reference them. deps is populated below so that MarkShuttingDown
@@ -330,23 +329,39 @@ func run() (err error) {
 			if !lastAt.IsZero() {
 				lastAtStr = lastAt.Format(time.RFC3339)
 			}
+			// AP isolation detection: on a wireless iface with a
+			// successful scan, zero or exactly 1 non-self reply means
+			// other clients are unreachable — the AP is filtering
+			// intra-client traffic. ARP poison frames won't reach
+			// victims.
+			apIso := wifiInfo.Wireless && replies <= 1
+			// Check whether send_redirects is currently enforced.
+			// The daemon sets these at startup, but NetworkManager
+			// or systemd-networkd may reset them on link events.
+			redirectsOn := legacySysctlGet("net/ipv4/conf/" + info.Name + "/send_redirects") != "0"
+			fwdOn := legacySysctlGet("net/ipv4/ip_forward") == "1"
+
 			return rpc.SessionDTO{
-				Iface:           info.Name,
-				MAC:             info.HwAddr.String(),
-				IP:              info.IP.String(),
-				CIDR:            cidrStr,
-				Gateway:         gwStr,
-				GwMAC:           gwMAC.String(),
-				Wireless:        wifiInfo.Wireless,
-				SSID:            wifiInfo.SSID,
-				BSSID:           wifiInfo.BSSID,
-				SignalDBm:       wifiInfo.SignalDBm,
-				TxRateMbit:      wifiInfo.TxRateMbit,
-				FreqMHz:         wifiInfo.FreqMHz,
-				PoisonsActive:   len(arp.Active()),
-				DevicesTotal:    len(store.List()),
-				LastScanAt:      lastAtStr,
-				LastScanReplies: replies,
+				Iface:              info.Name,
+				MAC:                info.HwAddr.String(),
+				IP:                 info.IP.String(),
+				CIDR:               cidrStr,
+				Gateway:            gwStr,
+				GwMAC:              gwMAC.String(),
+				Wireless:           wifiInfo.Wireless,
+				SSID:               wifiInfo.SSID,
+				BSSID:              wifiInfo.BSSID,
+				SignalDBm:          wifiInfo.SignalDBm,
+				TxRateMbit:         wifiInfo.TxRateMbit,
+				FreqMHz:            wifiInfo.FreqMHz,
+				PoisonsActive:      len(arp.Active()),
+				ArpWriteFailures:   arp.WriteFailures(),
+				ApIsolationLikely:  apIso,
+				SendRedirectsActive: redirectsOn,
+				ForwardingEnabled:  fwdOn,
+				DevicesTotal:       len(store.List()),
+				LastScanAt:         lastAtStr,
+				LastScanReplies:    replies,
 			}
 		},
 	}
@@ -431,6 +446,35 @@ func run() (err error) {
 				// when at least one consumer cares.
 				if srv.HasClients() {
 					srv.Broadcast(rpc.EventCountersTick, map[string]any{"ts": time.Now().Unix()})
+				}
+			}
+		}
+	}()
+
+	// Periodic sysctl guard: NetworkManager and systemd-networkd can reset
+	// send_redirects back to defaults when a link flaps or a DHCP renewal
+	// touches the interface. Check every 10s and re-disable if necessary.
+	// Dormant when no policies are active — redirects being on doesn't
+	// matter when we're not MITMing anyone.
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if len(arp.Active()) == 0 {
+					continue
+				}
+				if v := legacySysctlGet("net/ipv4/conf/all/send_redirects"); v != "" && v != "0" {
+					_, _ = writeSysctl("/proc/sys/net/ipv4/conf/all/send_redirects", "0")
+				}
+				if v := legacySysctlGet("net/ipv4/conf/" + info.Name + "/send_redirects"); v != "" && v != "0" {
+					_, _ = writeSysctl("/proc/sys/net/ipv4/conf/"+info.Name+"/send_redirects", "0")
+				}
+				if v := legacySysctlGet("net/ipv4/ip_forward"); v != "" && v != "1" {
+					_, _ = writeSysctl("/proc/sys/net/ipv4/ip_forward", "1")
 				}
 			}
 		}

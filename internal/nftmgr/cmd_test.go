@@ -19,12 +19,22 @@ func TestArgvEnsureMarkChainBindsToIface(t *testing.T) {
 	assert.Contains(t, got[len(got)-1], "device eth0")
 }
 
-func TestArgvAddDropRule(t *testing.T) {
+func TestArgvAddDropRuleEgress(t *testing.T) {
 	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:01")
-	got := argvAddDropRule(mac)
+	got := argvAddDropRuleEgress(mac)
 	assert.Equal(t, []string{
 		"add", "rule", "inet", "shardflow", "forward_chain",
 		"ether", "saddr", "aa:bb:cc:dd:ee:01", "drop",
+		"comment", `"shardflow:aa:bb:cc:dd:ee:01"`,
+	}, got)
+}
+
+func TestArgvAddDropRuleIngress(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:01")
+	got := argvAddDropRuleIngress(mac)
+	assert.Equal(t, []string{
+		"add", "rule", "inet", "shardflow", "forward_chain",
+		"ether", "daddr", "aa:bb:cc:dd:ee:01", "drop",
 		"comment", `"shardflow:aa:bb:cc:dd:ee:01"`,
 	}, got)
 }

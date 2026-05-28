@@ -68,6 +68,9 @@ type HandlerDeps struct {
 	// gain. We TryLock here and reject overlapping requests with a clear
 	// error rather than queue them.
 	scanMu sync.Mutex
+
+	// lastScanAt tracks when the last scan completed for rate-limiting.
+	lastScanAt time.Time
 }
 
 // scanHardTimeout is the absolute upper bound on a single Scan. Internally
@@ -78,6 +81,10 @@ type HandlerDeps struct {
 // for tens of milliseconds. Without an outer cap one Scan call could
 // otherwise run for minutes and the TUI would freeze on c.Call.
 const scanHardTimeout = 15 * time.Second
+
+// scanMinInterval is the minimum time between successive scans. Prevents
+// abuse where a misbehaving client floods the LAN with back-to-back scans.
+const scanMinInterval = 5 * time.Second
 
 // MarkShuttingDown blocks new Policy.Set/Policy.Clear handler invocations.
 // Called from the daemon's signal handler before tearing down state.
@@ -96,11 +103,16 @@ func BuildHandlers(d *HandlerDeps) map[string]Handler {
 				return nil, &Error{Code: CodeInternalError, Message: "scan already in progress"}
 			}
 			defer d.scanMu.Unlock()
+			// Rate-limit: reject if last scan was too recent.
+			if time.Since(d.lastScanAt) < scanMinInterval {
+				return nil, &Error{Code: CodeInternalError, Message: fmt.Sprintf("scan rate-limited; wait %v", scanMinInterval-time.Since(d.lastScanAt))}
+			}
 			sCtx, cancel := context.WithTimeout(ctx, scanHardTimeout)
 			defer cancel()
 			if err := d.Scanner(sCtx); err != nil {
 				return nil, &Error{Code: CodeInternalError, Message: err.Error()}
 			}
+			d.lastScanAt = time.Now()
 			return map[string]string{"status": "ok"}, nil
 		},
 		MethodDevicesList: func(_ context.Context, _ json.RawMessage) (any, *Error) {

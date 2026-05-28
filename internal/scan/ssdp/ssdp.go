@@ -7,7 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"net/http"
+	"net/textproto"
 	"strings"
 	"time"
 
@@ -75,15 +75,34 @@ func Query(ctx context.Context, ifaceName string, window time.Duration, onObs fu
 	}
 }
 
+// parseSSDPResponse parses an SSDP M-SEARCH response manually (not via
+// http.ReadResponse) to avoid unbounded allocation from crafted packets.
+// Returns an observation with the SERVER header if present.
 func parseSSDPResponse(b []byte, ip net.IP) (devicestore.Observation, bool) {
-	resp, err := http.ReadResponse(bufio.NewReader(strings.NewReader(string(b))), nil)
+	// Cap input size to prevent excessive allocation.
+	const maxSize = 4096
+	if len(b) > maxSize {
+		b = b[:maxSize]
+	}
+	// SSDP responses are HTTP-ish: first line is status, followed by headers.
+	r := textproto.NewReader(bufio.NewReader(strings.NewReader(string(b))))
+	// Read and discard the status line.
+	_, err := r.ReadLine()
 	if err != nil {
 		return devicestore.Observation{}, false
 	}
-	defer resp.Body.Close()
-	server := strings.TrimSpace(resp.Header.Get("SERVER"))
+	// Read headers (MIME-style).
+	headers, err := r.ReadMIMEHeader()
+	if err != nil {
+		return devicestore.Observation{}, false
+	}
+	server := strings.TrimSpace(headers.Get("Server"))
 	if server == "" {
 		return devicestore.Observation{}, false
+	}
+	// Cap server string length.
+	if len(server) > 256 {
+		server = server[:256]
 	}
 	// SERVER goes into Model — it describes firmware/device-kind, not the
 	// MAC's silicon vendor. Storing it as Vendor would clobber the OUI

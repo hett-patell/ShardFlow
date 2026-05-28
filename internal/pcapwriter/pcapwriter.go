@@ -1,13 +1,16 @@
 // Package pcapwriter writes per-target pcap-ng files from libpcap on the
 // shardflow-cap dummy iface, with a per-target BPF filter so concurrent
 // pcap policies don't cross-contaminate each other's files. Rotates by
-// size or age.
+// size or age, and enforces a retention policy (max files per target).
 package pcapwriter
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +24,7 @@ import (
 const (
 	DefaultMaxBytes = 100 * 1024 * 1024 // 100 MB
 	DefaultMaxAge   = 15 * time.Minute
+	DefaultMaxFiles = 10                // retain at most 10 files per target (~1GB max)
 )
 
 // Manager owns one pcap writer goroutine per target MAC.
@@ -51,7 +55,7 @@ func New() *Manager { return &Manager{writers: map[string]*writer{}} }
 // and the target's IP (for return: gateway→target). The two arguments
 // together compose the BPF: `ether src <mac> or ip dst <ip>`.
 func (m *Manager) Open(mac, ipStr, srcIface, dir string, maxBytes int64, maxAge time.Duration) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	if maxBytes == 0 {
@@ -152,7 +156,7 @@ func runWriter(ctx context.Context, mac, ipStr, srcIface, dir string, maxBytes i
 
 	open := func() (*os.File, *pcapgo.NgWriter, rotation, error) {
 		path := nextFilename(dir, mac, time.Now())
-		f, err := os.Create(path)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 		if err != nil {
 			return nil, nil, rotation{}, err
 		}
@@ -161,6 +165,8 @@ func runWriter(ctx context.Context, mac, ipStr, srcIface, dir string, maxBytes i
 			_ = f.Close()
 			return nil, nil, rotation{}, err
 		}
+		// Enforce retention policy: delete oldest files if over limit.
+		enforceRetention(dir, mac, DefaultMaxFiles)
 		return f, w, rotation{maxBytes: maxBytes, maxAge: maxAge, started: time.Now()}, nil
 	}
 	f, w, r, err := open()
@@ -203,5 +209,23 @@ func runWriter(ctx context.Context, mac, ipStr, srcIface, dir string, maxBytes i
 			}
 			written += int64(len(data))
 		}
+	}
+}
+
+// enforceRetention deletes oldest pcap files for the given MAC if there are
+// more than maxFiles. Files are identified by the MAC prefix pattern.
+func enforceRetention(dir, mac string, maxFiles int) {
+	macSafe := strings.ReplaceAll(mac, ":", "-")
+	pattern := filepath.Join(dir, macSafe+"-*.pcapng")
+	matches, err := filepath.Glob(pattern)
+	if err != nil || len(matches) <= maxFiles {
+		return
+	}
+	// Sort by name (which includes timestamp, so lexicographic = chronological).
+	sort.Strings(matches)
+	// Delete oldest files until we're at maxFiles.
+	toDelete := len(matches) - maxFiles
+	for i := 0; i < toDelete; i++ {
+		_ = os.Remove(matches[i])
 	}
 }

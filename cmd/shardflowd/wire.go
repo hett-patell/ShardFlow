@@ -22,7 +22,7 @@ func preflight(sockPath, realIface string, force, clean bool) error {
 		}
 		_ = os.Remove(sockPath)
 	}
-	if err := os.MkdirAll(filepathDir(sockPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepathDir(sockPath), 0o700); err != nil {
 		return err
 	}
 	type probe struct {
@@ -55,6 +55,12 @@ func preflight(sockPath, realIface string, force, clean bool) error {
 				return err == nil && strings.Contains(string(out), "ingress")
 			},
 			func() { run("tc", "qdisc", "del", "dev", realIface, "ingress") }},
+		{realIface + " egress HTB qdisc (orphaned from prior run)",
+			func() bool {
+				out, err := exec.Command("tc", "qdisc", "show", "dev", realIface).CombinedOutput()
+				return err == nil && strings.Contains(string(out), "htb 1:")
+			},
+			func() { run("tc", "qdisc", "del", "dev", realIface, "root") }},
 	}
 	var orphans []string
 	for _, p := range probes {
@@ -90,23 +96,41 @@ func setIPv4Forward(v string) (string, error) {
 	return writeSysctl("/proc/sys/net/ipv4/ip_forward", v)
 }
 
+// sendRedirectsPrev holds the previous sysctl values for restoration on shutdown.
+type sendRedirectsPrev struct {
+	all, def, iface string
+}
+
 // disableSendRedirects turns off ICMP Redirect emission on the operator's
-// real iface and the global "all" knob. With redirects on, the kernel sees
-// the routed-back-to-itself MITM traffic and helpfully tells the victim
-// to bypass us — defeating the policy. Returns the previous values so the
-// caller can restore them on shutdown.
-func disableSendRedirects(realIface string) (prevAll, prevIface string, err error) {
-	prevAll, err = writeSysctl("/proc/sys/net/ipv4/conf/all/send_redirects", "0")
+// real iface, the global "all" knob, AND the "default" knob. With redirects
+// on, the kernel sees the routed-back-to-itself MITM traffic and helpfully
+// tells the victim to bypass us — defeating the policy.
+//
+// IMPORTANT: We must disable all three:
+//   - all:     global override (but doesn't always stick)
+//   - default: affects new interfaces and can reset per-iface settings
+//   - <iface>: the specific interface we're using
+//
+// Returns the previous values so the caller can restore them on shutdown.
+func disableSendRedirects(realIface string) (prev sendRedirectsPrev, err error) {
+	prev.all, err = writeSysctl("/proc/sys/net/ipv4/conf/all/send_redirects", "0")
 	if err != nil {
-		return "", "", fmt.Errorf("disable all send_redirects: %w", err)
+		return prev, fmt.Errorf("disable all send_redirects: %w", err)
 	}
-	prevIface, err = writeSysctl("/proc/sys/net/ipv4/conf/"+realIface+"/send_redirects", "0")
+	prev.def, err = writeSysctl("/proc/sys/net/ipv4/conf/default/send_redirects", "0")
 	if err != nil {
-		// Best-effort restore of all/send_redirects before bubbling.
-		_, _ = writeSysctl("/proc/sys/net/ipv4/conf/all/send_redirects", prevAll)
-		return "", "", fmt.Errorf("disable %s send_redirects: %w", realIface, err)
+		// Best-effort restore before bubbling.
+		_, _ = writeSysctl("/proc/sys/net/ipv4/conf/all/send_redirects", prev.all)
+		return prev, fmt.Errorf("disable default send_redirects: %w", err)
 	}
-	return prevAll, prevIface, nil
+	prev.iface, err = writeSysctl("/proc/sys/net/ipv4/conf/"+realIface+"/send_redirects", "0")
+	if err != nil {
+		// Best-effort restore before bubbling.
+		_, _ = writeSysctl("/proc/sys/net/ipv4/conf/all/send_redirects", prev.all)
+		_, _ = writeSysctl("/proc/sys/net/ipv4/conf/default/send_redirects", prev.def)
+		return prev, fmt.Errorf("disable %s send_redirects: %w", realIface, err)
+	}
+	return prev, nil
 }
 
 func writeSysctl(path, v string) (string, error) {
@@ -118,6 +142,17 @@ func writeSysctl(path, v string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(prev)), nil
+}
+
+// legacySysctlGet reads numeric strings from the legacy /proc/sys/ tree.
+// Differences from writeSysctl: doesn't need to write anything; doesn't
+// care about errors (best-effort diagnostic lookup only).
+func legacySysctlGet(name string) string {
+	out, err := os.ReadFile("/proc/sys/" + name)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // resolveGatewayMAC asks the kernel to resolve info.Gateway's MAC by sending

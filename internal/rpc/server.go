@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -72,14 +73,22 @@ func NewServer(h map[string]Handler) *Server {
 }
 
 // Listen binds the Unix socket at path and serves until ctx is cancelled
-// or Stop is called.
+// or Stop is called. The socket is created with mode 0600 (owner-only).
 func (s *Server) Listen(ctx context.Context, path string) error {
 	_ = os.Remove(path)
+	// Set restrictive umask before creating the socket so it's never
+	// exposed with permissive mode even briefly (avoids TOCTOU race
+	// between net.Listen and os.Chmod).
+	oldUmask := syscall.Umask(0o077)
 	l, err := net.Listen("unix", path)
+	syscall.Umask(oldUmask) // restore immediately
 	if err != nil {
 		return err
 	}
+	// Explicitly chmod to 0600 as a defense-in-depth measure — the umask
+	// should have done it, but some systems have quirks.
 	if err := os.Chmod(path, 0o600); err != nil {
+		_ = l.Close()
 		return err
 	}
 	s.mu.Lock()

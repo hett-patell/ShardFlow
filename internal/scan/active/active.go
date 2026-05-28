@@ -129,17 +129,17 @@ func SweepWithWriter(ctx context.Context, ifaceName string, srcMAC net.HardwareA
 	// Sender loop — also respects ctx so a cancelled sweep doesn't block
 	// flushing the entire CIDR through the kernel.
 	//
-	// Pacing: on Wi-Fi a /24 (256 frames) takes <50ms unpaced and is fine,
-	// but a /16 (65k frames) saturates the AP for ~1s and we lose replies
-	// to our own back-pressure. We rate-cap at ~10k frames/sec by sleeping
-	// 100µs between sends — total time for a /24 is ~25ms (negligible),
-	// for a /16 is ~6.5s (vs the listener window, which the caller sets
-	// at 2s; tune up at your CIDR's discretion).
+	// Pacing: ALWAYS pace at 50µs minimum between sends to avoid triggering
+	// AP/IDS rate-limiters. On Wi-Fi, a burst of >50 ARP/s from a single
+	// MAC can trigger WIDS "ARP storm" alerts. Additional adaptive pacing
+	// for large CIDRs: we rate-cap at ~10k frames/sec by sleeping 100µs
+	// between sends — total time for a /24 is ~25ms (negligible), for a
+	// /16 is ~6.5s.
 	hostBits, _ := cidr.Mask.Size()
 	totalHosts := 1 << uint(32-hostBits)
-	const pacingThreshold = 256
-	pacingDelay := time.Duration(0)
-	if totalHosts > pacingThreshold {
+	// Always pace at least 50µs; for large CIDRs bump to 100µs.
+	pacingDelay := 50 * time.Microsecond
+	if totalHosts > 256 {
 		pacingDelay = 100 * time.Microsecond
 	}
 	// Pre-build the Eth+ARP frame once. Only DstProtAddress (offset

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/hett-patell/ShardFlow/internal/arpengine"
@@ -13,28 +14,33 @@ import (
 
 // Compiler orchestrates the four effectors.
 type Compiler struct {
-	nft       NFT
-	tc        TC
-	pcap      Pcap
-	arp       ARP
-	realIface string
+	nft         NFT
+	tc          TC
+	pcap        Pcap
+	arp         ARP
+	realIface   string
+	operatorMAC net.HardwareAddr // operator's own MAC — policies targeting this are rejected
 
-	mu       sync.RWMutex
-	current  map[string]Spec   // key: MAC.String()
-	markOf   map[string]uint32 // key: MAC.String() — fwmark currently in use
-	freeMarks []uint32         // marks released by teardown, reused before allocating new
-	nextMark uint32
+	mu        sync.RWMutex
+	current   map[string]Spec   // key: MAC.String()
+	markOf    map[string]uint32 // key: MAC.String() — fwmark currently in use
+	freeMarks []uint32          // marks released by teardown, reused before allocating new
+	nextMark  uint32
 }
 
 // New constructs a compiler bound to the operator's real iface (used by
 // nft and tc when installing per-target rules and filters).
-func New(nft NFT, tc TC, pcap Pcap, arp ARP, realIface string) *Compiler {
+//
+// operatorMAC is the hardware address of the operator's interface. Policies
+// targeting this MAC are rejected to prevent self-DoS.
+func New(nft NFT, tc TC, pcap Pcap, arp ARP, realIface string, operatorMAC net.HardwareAddr) *Compiler {
 	return &Compiler{
 		nft: nft, tc: tc, pcap: pcap, arp: arp,
-		realIface: realIface,
-		current:   map[string]Spec{},
-		markOf:    map[string]uint32{},
-		nextMark:  10, // start at 10 so 1..9 are reserved for future use
+		realIface:   realIface,
+		operatorMAC: operatorMAC,
+		current:     map[string]Spec{},
+		markOf:      map[string]uint32{},
+		nextMark:    10, // start at 10 so 1..9 are reserved for future use
 	}
 }
 
@@ -86,6 +92,16 @@ func (c *Compiler) releaseMark(mac string) {
 func (c *Compiler) Apply(ctx context.Context, desired map[string]Spec) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Self-MAC protection: reject any policy targeting the operator's own
+	// MAC address. This prevents accidental self-DoS (e.g. if the gateway
+	// scanner misidentifies us, or a user typo). Checked before any state
+	// mutation so the request fails atomically.
+	for mac, spec := range desired {
+		if c.isSelfMAC(spec.Target.MAC) {
+			return fmt.Errorf("refusing policy on operator's own MAC %s: self-DoS protection", mac)
+		}
+	}
 
 	var firstErr error
 	record := func(err error) {
@@ -197,6 +213,8 @@ func (c *Compiler) Apply(ctx context.Context, desired map[string]Spec) error {
 
 func (c *Compiler) bringUpOne(ctx context.Context, s Spec) error {
 	macStr := s.Target.MAC.String()
+	// Check if this is a new allocation (vs reusing existing mark for same MAC).
+	_, hadMark := c.markOf[macStr]
 	mark := c.markFor(macStr)
 	rate := strconv.Itoa(s.RateKbit) + "kbit"
 
@@ -240,13 +258,25 @@ func (c *Compiler) bringUpOne(ctx context.Context, s Spec) error {
 		undo: func() error { return c.arp.Stop(s.Target) },
 	})
 
+	var undoErrs []error
 	for i, st := range steps {
 		if err := st.do(); err != nil {
 			// Run the failing step's own undo first — its do() may have
 			// partially applied state. Then unwind earlier successful steps.
-			_ = st.undo()
+			if undoErr := st.undo(); undoErr != nil {
+				undoErrs = append(undoErrs, fmt.Errorf("undo step %d: %w", i, undoErr))
+			}
 			for j := i - 1; j >= 0; j-- {
-				_ = steps[j].undo()
+				if undoErr := steps[j].undo(); undoErr != nil {
+					undoErrs = append(undoErrs, fmt.Errorf("undo step %d: %w", j, undoErr))
+				}
+			}
+			// Release the mark if it was newly allocated (not pre-existing).
+			if !hadMark {
+				c.releaseMark(macStr)
+			}
+			if len(undoErrs) > 0 {
+				return fmt.Errorf("step %d: %w; undo errors: %v", i, err, undoErrs)
 			}
 			return fmt.Errorf("step %d: %w", i, err)
 		}
@@ -290,6 +320,9 @@ func specsEqual(a, b Spec) bool {
 		a.MaxBytes != b.MaxBytes || a.MaxAge != b.MaxAge {
 		return false
 	}
+	if !bytes.Equal(a.Target.MAC, b.Target.MAC) {
+		return false
+	}
 	if !a.Target.IP.Equal(b.Target.IP) {
 		return false
 	}
@@ -325,4 +358,13 @@ func (c *Compiler) Snapshot() map[string]Spec {
 		out[k] = v
 	}
 	return out
+}
+
+// isSelfMAC returns true if mac matches the operator's own hardware address.
+// Comparison is case-insensitive to handle variations in MAC string format.
+func (c *Compiler) isSelfMAC(mac net.HardwareAddr) bool {
+	if c.operatorMAC == nil || len(mac) == 0 {
+		return false
+	}
+	return strings.EqualFold(mac.String(), c.operatorMAC.String())
 }

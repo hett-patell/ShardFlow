@@ -83,7 +83,11 @@ func buildQuery(name string) []byte {
 // PTR (service-discovery pointer) records — each independently observable
 // in normal Bonjour traffic. Records that don't carry usable identity
 // information are skipped without aborting the parse.
+//
+// Safety: caps iterations at 256 RRs per packet to prevent DoS from
+// crafted mDNS replies with inflated answer counts.
 func parseMDNS(pkt []byte, src *net.UDPAddr, onObs func(devicestore.Observation)) {
+	const maxRecords = 256
 	var p dnsmessage.Parser
 	if _, err := p.Start(pkt); err != nil {
 		return
@@ -91,10 +95,17 @@ func parseMDNS(pkt []byte, src *net.UDPAddr, onObs func(devicestore.Observation)
 	if err := p.SkipAllQuestions(); err != nil {
 		return
 	}
-	for {
+	records := 0
+	for records < maxRecords {
 		h, err := p.AnswerHeader()
 		if err != nil {
 			return
+		}
+		records++
+		// Cap hostname length to prevent memory exhaustion from pathological names.
+		hostname := h.Name.String()
+		if len(hostname) > 253 { // DNS max label length
+			hostname = hostname[:253]
 		}
 		switch h.Type {
 		case dnsmessage.TypeA:
@@ -105,7 +116,7 @@ func parseMDNS(pkt []byte, src *net.UDPAddr, onObs func(devicestore.Observation)
 			// Copy r.A into a fresh slice — r.A lives on the stack-allocated
 			// parser; aliasing via r.A[:] would be unsafe across iterations.
 			onObs(devicestore.Observation{
-				Hostname: trimDot(h.Name.String()),
+				Hostname: trimDot(hostname),
 				IP:       net.IP{r.A[0], r.A[1], r.A[2], r.A[3]},
 				Seen:     time.Now(),
 			})
@@ -119,7 +130,7 @@ func parseMDNS(pkt []byte, src *net.UDPAddr, onObs func(devicestore.Observation)
 				continue
 			}
 			target := trimDot(r.Target.String())
-			if target == "" {
+			if target == "" || len(target) > 253 {
 				continue
 			}
 			onObs(devicestore.Observation{
@@ -138,12 +149,12 @@ func parseMDNS(pkt []byte, src *net.UDPAddr, onObs func(devicestore.Observation)
 			if err != nil {
 				continue
 			}
-			ownerName := trimDot(h.Name.String())
+			ownerName := trimDot(hostname)
 			if strings.HasPrefix(ownerName, "_services._dns-sd._udp") {
 				continue
 			}
 			ptrName := trimDot(r.PTR.String())
-			if ptrName == "" {
+			if ptrName == "" || len(ptrName) > 253 {
 				continue
 			}
 			onObs(devicestore.Observation{

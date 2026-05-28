@@ -21,7 +21,7 @@ Usage: sudo $0 [-i <iface>] [-s <sock>] [-c <cadence>]
 
   -i <iface>     network interface to operate on (default: auto-detect)
   -s <sock>      Unix socket path (default: $SOCK)
-  -c <cadence>   ARP poison cadence (e.g. 200ms, 50ms). Default 1s in the
+  -c <cadence>   ARP poison cadence (e.g. 200ms, 50ms). Default 200ms in the
                  daemon. Lower = more aggressive (use 50ms for stubborn
                  modern phones); cost is a slower 'policy clear' since
                  the corrective has to flood harder to win the cache back.

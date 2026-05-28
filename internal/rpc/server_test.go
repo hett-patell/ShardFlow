@@ -67,11 +67,13 @@ func TestSetPolicyConcurrentRMWDoesNotClobber(t *testing.T) {
 	store.Upsert(devicestore.Observation{MAC: mac2, IP: net.ParseIP("10.0.0.2").To4()})
 
 	// Use the real Compiler with no-op fakes for effectors.
+	// Operator MAC is set to something that won't collide with test targets.
 	nft := noopNFT{}
 	tc := noopTC{}
 	pc := noopPcap{}
 	arp := noopARP{}
-	comp := policycompiler.New(nft, tc, pc, arp, "lo")
+	operatorMAC, _ := net.ParseMAC("00:11:22:33:44:55")
+	comp := policycompiler.New(nft, tc, pc, arp, "lo", operatorMAC)
 
 	deps := &HandlerDeps{
 		Store:    store,

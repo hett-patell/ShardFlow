@@ -97,9 +97,7 @@ type PolicySpec struct {
 
 // SessionDTO describes the operator's connection at a moment in time:
 // the network they're pentesting (iface, IP, gateway, optionally WiFi
-// SSID/BSSID/signal) plus a few diagnostic counters from the most
-// recent scan. The TUI's SESSION panel displays this; the AP-isolation
-// hint is computed client-side from Wireless && LastScanReplies <= 1.
+// SSID/BSSID/signal) plus diagnostic counters from the most recent scan.
 type SessionDTO struct {
 	Iface   string `json:"iface"`
 	MAC     string `json:"mac"`
@@ -115,10 +113,14 @@ type SessionDTO struct {
 	TxRateMbit float64 `json:"tx_rate_mbit,omitempty"`
 	FreqMHz    int     `json:"freq_mhz,omitempty"`
 
-	PoisonsActive   int    `json:"poisons_active"`
-	DevicesTotal    int    `json:"devices_total"`
-	LastScanAt      string `json:"last_scan_at,omitempty"` // RFC 3339
-	LastScanReplies int    `json:"last_scan_replies"`      // unique reply MACs
+	PoisonsActive       int    `json:"poisons_active"`
+	ArpWriteFailures    int    `json:"arp_write_failures"`
+	ApIsolationLikely   bool   `json:"ap_isolation_likely"`
+	SendRedirectsActive bool   `json:"send_redirects_active"`
+	ForwardingEnabled   bool   `json:"forwarding_enabled"`
+	DevicesTotal        int    `json:"devices_total"`
+	LastScanAt          string `json:"last_scan_at,omitempty"` // RFC 3339
+	LastScanReplies     int    `json:"last_scan_replies"`      // unique reply MACs
 }
 
 // Method names, exported as constants so client and server can't drift.

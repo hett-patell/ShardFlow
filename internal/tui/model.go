@@ -969,16 +969,36 @@ func renderSessionPanel(m model, innerWidth int) string {
 	body.WriteString(rowDim.Render(fmt.Sprintf("%-7s ", "poisons")) +
 		statusAccent.Render(fmt.Sprint(s.PoisonsActive)) + "\n")
 
-	// Diagnostic line: AP isolation is the #1 reason a wireless scan
-	// returns nothing useful. Surface it instead of letting the
-	// operator wonder why their device list is empty.
 	if s.LastScanAt != "" {
 		body.WriteString(rowDim.Render("scan    ") +
 			hostStyle.Render(fmt.Sprintf("%d replies", s.LastScanReplies)) + "\n")
-		if s.Wireless && s.LastScanReplies <= 1 {
-			body.WriteString(reconnectStyle.Render("⚠ AP isolation likely") + "\n")
-			body.WriteString(rowDim.Render("  guests cannot reach guests") + "\n")
-		}
+	}
+
+	// Server-side diagnostics: the daemon now pre-computes these.
+	// AP isolation is the #1 reason a wireless scan returns nothing.
+	if s.LastScanAt != "" && s.Wireless && s.ApIsolationLikely {
+		body.WriteString(reconnectStyle.Render("⚠ AP ISOLATION ACTIVE") + "\n")
+		body.WriteString(rowDim.Render("  ARP frames cannot reach other clients") + "\n")
+	}
+
+	// ARP write failures mean the pcap socket can't send raw frames —
+	// the poison never leaves the wire. Zero feedback without this.
+	if s.ArpWriteFailures > 0 {
+		body.WriteString(keyChipDanger.Render("⚠ ARP WRITE FAILURES: "+fmt.Sprint(s.ArpWriteFailures)) + "\n")
+		body.WriteString(rowDim.Render("  pcap socket cannot inject frames — policies are DEAD") + "\n")
+	}
+
+	// ICMP redirects being ON silently defeats ARP poisoning:
+	// the kernel tells victims to bypass us.
+	if s.SendRedirectsActive {
+		body.WriteString(keyChipDanger.Render("⚠ SENDS REDIRECTS ACTIVE") + "\n")
+		body.WriteString(rowDim.Render("  kernel is telling targets to bypass us") + "\n")
+	}
+
+	// ip_forward being OFF means traffic can't transit through us.
+	if !s.ForwardingEnabled {
+		body.WriteString(keyChipDanger.Render("⚠ IP FORWARDING OFF") + "\n")
+		body.WriteString(rowDim.Render("  kernel won't route traffic through us") + "\n")
 	}
 	return panelBox.Width(innerWidth).Render(body.String())
 }
